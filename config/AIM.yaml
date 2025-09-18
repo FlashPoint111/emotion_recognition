@@ -1,0 +1,20 @@
+dataset:
+  dir: F:/MAFW/data/clips
+  frames_dir: F:/MAFW/data/frames
+  required_frames: 16
+  required_audio_len: 1
+  sr: 16000
+  n_frame: 16
+  label_num: 11
+
+train:
+  label_dir: F:/MAFW/Train & Test Set/single/no_caption/set_2/train.txt
+  use_frame: True
+  batch_size: 8
+  resume: True
+  checkpoint_path: ./output/checkpoint_49.pth
+  output_dir: ./output/
+  pretrain_file: F:/mae_face_pretrain_vit_base.pth
+
+test:
+  label_dir: F:/MAFW/Train & Test Set/single/no_caption/set_2/test.txt
