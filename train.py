@@ -104,7 +104,7 @@ def main():
         config = yaml.safe_load(f)
 
     start_epoch = 0
-    max_epoch = 50
+    max_epoch = 30
     warmup_steps = 1e-5
 
     print("Creating dataset")

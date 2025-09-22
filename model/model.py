@@ -55,6 +55,8 @@ class AIM(nn.Module):
         self.avg_pool = nn.AdaptiveAvgPool3d((1, 1, 1))
         self.dropout = nn.Dropout(0.5)
         self.fc_cls = nn.Linear(768, label_num)
+        self.dw = nn.Conv1d(768, 768, 3, padding=1, groups=768, bias=True)
+        self.shuffle_cls = nn.Linear(768*self.n_frame, 1)
         for name, param in self.encoder.named_parameters():
             param.requires_grad = False
             tmp = 1
@@ -81,15 +83,18 @@ class AIM(nn.Module):
         print('####### Total params in M: %0.1f M  #######' % (total_params / 1000000))
 
     def forward(self, x, label=None):
-        x = self.encoder(x)
+        x, shuffle_flag = self.encoder(x)
         x = rearrange(x, '(b t) d -> b d t', t=self.n_frame)
+        x_shuffle = rearrange(x, 'b d t -> b (t d)', t=self.n_frame, d=768)
         x = x.unsqueeze(-1).unsqueeze(-1)
         x = self.avg_pool(x)
         x = x.view(x.shape[0], -1)
 
         logits = self.fc_cls(x)
         if label is not None:
+            shuffle_logits = self.shuffle_cls(x_shuffle)
             ce_loss = F.cross_entropy(logits, label)
-            return ce_loss
+            shuffle_loss = F.binary_cross_entropy_with_logits(shuffle_logits, shuffle_flag.unsqueeze(-1))
+            return ce_loss + shuffle_loss
         else:
             return logits
