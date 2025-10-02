@@ -10,9 +10,9 @@ dataset:
 train:
   label_dir: F:/MAFW/Train & Test Set/single/no_caption/set_2/train.txt
   use_frame: True
-  batch_size: 8
+  batch_size: 4
   resume: True
-  checkpoint_path: ./output/checkpoint_29.pth
+  checkpoint_path: ./output/checkpoint_39.pth
   output_dir: ./output/
   pretrain_file: F:/mae_face_pretrain_vit_base.pth
 
