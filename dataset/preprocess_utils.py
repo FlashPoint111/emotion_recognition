@@ -3,7 +3,6 @@ import random
 import cv2
 import librosa
 import numpy as np
-from retinaface import RetinaFace
 from PIL import Image
 
 

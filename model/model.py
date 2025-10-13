@@ -4,7 +4,9 @@ from einops import rearrange
 from torch import nn
 
 from .vit_encoder import ViT_video
-
+from .clip_model import VisionTransformer
+from .lora_layers import *
+from .lora_utils import *
 
 def sup_contra_loss(logits, mask):
     logits = torch.log_softmax(logits, dim=1)
@@ -52,6 +54,7 @@ class AIM(nn.Module):
         total_params = 0
         additional_params = 0
         self.encoder = ViT_video(config["train"]["pretrain_file"])
+        self.encoder.init_weights()
         self.avg_pool = nn.AdaptiveAvgPool3d((1, 1, 1))
         self.dropout = nn.Dropout(0.5)
         self.fc_cls = nn.Linear(768, label_num)
@@ -68,7 +71,7 @@ class AIM(nn.Module):
                     param.requires_grad = True
                     train_params += tmp
 
-            elif 'Adapter' in name or 'norm' in name or 'conv3d' in name or 'share_tokens' in name or 'fdt' in name or 'temporal' in name:
+            elif 'Adapter' in name or 'norm' in name or 'video' in name or 'share_tokens' in name or 'fft' in name or 'temporal' in name:
                 param.requires_grad = True
                 train_params += tmp
                 additional_params += tmp
@@ -82,10 +85,10 @@ class AIM(nn.Module):
 
     def forward(self, x, label=None):
         x = self.encoder(x)
-        x = rearrange(x, '(b t) d -> b d t', t=self.n_frame)
+        '''x = rearrange(x, '(b t) d -> b d t', t=self.n_frame)
         x = x.unsqueeze(-1).unsqueeze(-1)
         x = self.avg_pool(x)
-        x = x.view(x.shape[0], -1)
+        x = x.view(x.shape[0], -1)'''
 
         logits = self.fc_cls(x)
         if label is not None:
@@ -93,3 +96,47 @@ class AIM(nn.Module):
             return ce_loss
         else:
             return logits
+
+
+class VideoClip(nn.Module):
+    def __init__(self, loss_fn=None):
+        super().__init__()
+        self.video_encoder = VisionTransformer(224, 16, 768, 12, 8, 768)
+        self.video_encoder.init_weights("ViT-B/16")
+        self.video_encoder = add_lora_to_clip_vision_encoder(
+            self.video_encoder,
+            lora_r=8,
+            lora_alpha=32,
+            lora_parts=['q', 'k', 'v', 'o']
+        )
+        self.avg_pool = nn.AdaptiveAvgPool3d((1, 1, 1))
+        self.dropout = nn.Dropout(0.5)
+        self.fc_cls = nn.Linear(768, 11)
+        for name, param in self.video_encoder.named_parameters():
+            if 'temporal' in name or 'ln_post' in name:
+                param.requires_grad = True
+            elif 'lora_' not in name:
+                param.requires_grad = False
+        self.loss_fn = loss_fn if loss_fn is not None else nn.CrossEntropyLoss()
+
+        trainable_params = list(filter(lambda p: p.requires_grad, self.parameters()))
+        num_trainable = sum(p.numel() for p in trainable_params)
+        total_params = sum(p.numel() for p in self.parameters())
+        print(f"Trainable parameters: {num_trainable}")
+        print(f"Total parameters: {total_params}")
+        print(f"Trainable ratio: {100 * num_trainable / total_params:.2f}%")
+
+    def forward(self, x, label=None):
+        x, is_ordered = self.video_encoder(x)
+        '''x = rearrange(x, '(b t) d -> b d t', t=16)
+        x = x.unsqueeze(-1).unsqueeze(-1)
+        x = self.avg_pool(x)
+        x = x.view(x.shape[0], -1)'''
+        x = self.dropout(x)
+        logits = self.fc_cls(x)
+        if label is not None:
+            ce_loss = self.loss_fn(logits, label)
+            return ce_loss
+        else:
+            return logits
+

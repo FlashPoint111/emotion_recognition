@@ -1,13 +1,15 @@
 import torch
 import torchaudio
-from torch.utils.data import DataLoader, Dataset
+from PIL import ImageFile
+from torch.utils.data import Dataset
 from torchvision import transforms
-from PIL import Image, ImageFile
-ImageFile.LOAD_TRUNCATED_IMAGES = True
 
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+from .random_erasing import RandomErasing
 from dataset.preprocess_dataset_MAFW import *
 from dataset.preprocess_utils import *
-from utils.randaugment import RandomAugment
+from . import video_transforms
+from . import volume_transforms
 
 
 def extract_audio(audio_path: str,
@@ -84,11 +86,169 @@ def extract_video(clip_path: str,
                 video.append(image)
         except Exception as e:
             print(f"Error loading {frame_idx}: {e}")
-
-    video = list(map(lambda x: img_process(x, transform), video))
-    video = torch.stack(video, dim=0).permute(1, 0, 2, 3)
-
+    if mode == 'train':
+        data_resize = video_transforms.Compose([
+            video_transforms.Resize(size=(256, 256))
+        ])
+        video = data_resize(video)
+        video = _aug_frame(video)
+    else:
+        data_transform = video_transforms.Compose([
+            video_transforms.Resize(size=(256, 256), interpolation='bilinear'),
+            video_transforms.CenterCrop(size=(224, 224)),
+            volume_transforms.ClipToTensor(),
+            video_transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
+                                       std=[0.26862954, 0.26130258, 0.27577711])
+        ])
+        video = data_transform(video)
     return video
+
+
+def _aug_frame(buffer):
+    aug_transform = video_transforms.create_random_augment(
+            input_size=(224, 224),
+            auto_augment='rand-m7-n4-mstd0.5-inc1',
+            interpolation='bicubic',
+        )
+
+    buffer = aug_transform(buffer)
+
+    buffer = [transforms.ToTensor()(img) for img in buffer]
+    buffer = torch.stack(buffer)  # T C H W
+    buffer = buffer.permute(0, 2, 3, 1)  # T H W C
+
+    buffer = tensor_normalize(
+        buffer, [0.48145466, 0.4578275, 0.40821073], [0.26862954, 0.26130258, 0.27577711]
+    )
+    # T H W C -> C T H W.
+    buffer = buffer.permute(3, 0, 1, 2)
+
+    scl, asp = (
+        # me: org min scale is too small
+        # [0.08, 1.0],
+        [0.08, 1.0],
+        [0.75, 1.3333],
+    )
+
+    buffer = spatial_sampling(
+        buffer,
+        spatial_idx=-1,
+        min_scale=256,
+        max_scale=320,
+        crop_size=224,
+        random_horizontal_flip=True,
+        inverse_uniform_sampling=False,
+        aspect_ratio=asp,
+        scale=scl,
+        motion_shift=False
+    )
+
+    erase_transform = RandomErasing(
+        0.25,
+        mode='pixel',
+        max_count=1,
+        num_splits=False,
+        device="cpu",
+    )
+    buffer = buffer.permute(1, 0, 2, 3)
+    buffer = erase_transform(buffer)
+    buffer = buffer.permute(1, 0, 2, 3)
+
+    return buffer
+
+
+def spatial_sampling(
+    frames,
+    spatial_idx=-1,
+    min_scale=256,
+    max_scale=320,
+    crop_size=224,
+    random_horizontal_flip=True,
+    inverse_uniform_sampling=False,
+    aspect_ratio=None,
+    scale=None,
+    motion_shift=False,
+):
+    """
+    Perform spatial sampling on the given video frames. If spatial_idx is
+    -1, perform random scale, random crop, and random flip on the given
+    frames. If spatial_idx is 0, 1, or 2, perform spatial uniform sampling
+    with the given spatial_idx.
+    Args:
+        frames (tensor): frames of images sampled from the video. The
+            dimension is `num frames` x `height` x `width` x `channel`.
+        spatial_idx (int): if -1, perform random spatial sampling. If 0, 1,
+            or 2, perform left, center, right crop if width is larger than
+            height, and perform top, center, buttom crop if height is larger
+            than width.
+        min_scale (int): the minimal size of scaling.
+        max_scale (int): the maximal size of scaling.
+        crop_size (int): the size of height and width used to crop the
+            frames.
+        inverse_uniform_sampling (bool): if True, sample uniformly in
+            [1 / max_scale, 1 / min_scale] and take a reciprocal to get the
+            scale. If False, take a uniform sample from [min_scale,
+            max_scale].
+        aspect_ratio (list): Aspect ratio range for resizing.
+        scale (list): Scale range for resizing.
+        motion_shift (bool): Whether to apply motion shift for resizing.
+    Returns:
+        frames (tensor): spatially sampled frames.
+    """
+    assert spatial_idx in [-1, 0, 1, 2]
+    if spatial_idx == -1:
+        if aspect_ratio is None and scale is None:
+            frames, _ = video_transforms.random_short_side_scale_jitter(
+                images=frames,
+                min_size=min_scale,
+                max_size=max_scale,
+                inverse_uniform_sampling=inverse_uniform_sampling,
+            )
+            frames, _ = video_transforms.random_crop(frames, crop_size)
+        else:
+            transform_func = (
+                video_transforms.random_resized_crop_with_shift
+                if motion_shift
+                else video_transforms.random_resized_crop
+            )
+            frames = transform_func(
+                images=frames,
+                target_height=crop_size,
+                target_width=crop_size,
+                scale=scale,
+                ratio=aspect_ratio,
+            )
+        if random_horizontal_flip:
+            frames, _ = video_transforms.horizontal_flip(0.5, frames)
+    else:
+        # The testing is deterministic and no jitter should be performed.
+        # min_scale, max_scale, and crop_size are expect to be the same.
+        assert len({min_scale, max_scale, crop_size}) == 1
+        frames, _ = video_transforms.random_short_side_scale_jitter(
+            frames, min_scale, max_scale
+        )
+        frames, _ = video_transforms.uniform_crop(frames, crop_size, spatial_idx)
+    return frames
+
+
+def tensor_normalize(tensor, mean, std):
+    """
+    Normalize a given tensor by subtracting the mean and dividing the std.
+    Args:
+        tensor (tensor): tensor to normalize.
+        mean (tensor or list): mean value to subtract.
+        std (tensor or list): std to divide.
+    """
+    if tensor.dtype == torch.uint8:
+        tensor = tensor.float()
+        tensor = tensor / 255.0
+    if type(mean) == list:
+        mean = torch.tensor(mean)
+    if type(std) == list:
+        std = torch.tensor(std)
+    tensor = tensor - mean
+    tensor = tensor / std
+    return tensor
 
 
 class ImageAudioDataset(Dataset):
@@ -119,33 +279,3 @@ class ImageAudioDataset(Dataset):
 
 def img_process(img: Image, transform: transforms.Compose):
     return transform(img)
-
-
-if __name__ == '__main__':
-
-    normalize = transforms.Normalize((0.3527, 0.2792, 0.2490), (0.2430, 0.2075, 0.1999))
-    pretrain_transform = transforms.Compose([
-        transforms.RandomResizedCrop(224, scale=(0.5, 1.0), interpolation=Image.BICUBIC),
-        transforms.RandomHorizontalFlip(),
-        RandomAugment(2, 7, isPIL=True, augs=['Identity', 'AutoContrast', 'Equalize', 'Brightness', 'Sharpness',
-                                              'ShearX', 'ShearY', 'TranslateX', 'TranslateY', 'Rotate']),
-        transforms.ToTensor(),
-        normalize,
-    ])
-
-    config = {
-        "dataset_dir": "F:/MAFW/data/clips",
-        "label_dir": "F:/MAFW/Train & Test Set/single/no_caption/set_1/test.txt",
-        "use_frame": True,
-        "dataset_frames_dir": "F:/MAFW/data/frames",
-        "required_frames": 16,
-        "required_audio_len": 1,
-        "sr": 16000,
-        'segments': 8,
-    }
-    dataset_info = run_preprocessing(config)
-    dataset = ImageAudioDataset(config, dataset_info, pretrain_transform, mode='val')
-    dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
-
-    for data in dataloader:
-        print(len(data))

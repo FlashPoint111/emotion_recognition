@@ -3,7 +3,8 @@ import torch.nn as nn
 from einops import rearrange
 
 from .custom_vit import my_vit
-
+from timm.models.layers import DropPath, trunc_normal_
+from timm.models.vision_transformer import Attention
 
 # from .sparsemax import Sparsemax
 
@@ -21,6 +22,7 @@ class Adapter(nn.Module):
         self.act = act_layer()
         self.D_fc1 = nn.Linear(D_features, D_hidden_features)
         self.D_fc2 = nn.Linear(D_hidden_features, D_features)
+        
 
     def forward(self, x):
         # x is (BT, HW+1, D)
@@ -47,13 +49,43 @@ class ViT_video(nn.Module):
 
         self.S_Adapter = nn.ModuleList(
             [Adapter(d_model, mlp_ratio=0.25) for d_model in hidden_list])
-        self.T_Adapter = nn.ModuleList(
-            [Adapter(d_model, mlp_ratio=0.25, skip_connect=False) for d_model in hidden_list])
         self.MLP_Adapter = nn.ModuleList(
             [Adapter(d_model, mlp_ratio=0.25, skip_connect=False) for d_model in hidden_list])
 
-        self.video_temporal_embedding = nn.Parameter(torch.zeros(1, 16, 768))
+        self.video_temporal_embedding = nn.Parameter(torch.zeros(1, 17, 768) * .02)
         self.scale = 768 ** -0.5
+        self.drop_path = DropPath(0.2)
+        self.video_cls = nn.Parameter(torch.randn(1, 1, 768) * .02)
+        self.video_attn = Attention(768)
+
+
+    def init_weights(self, pretrained=None):
+        def _init_weights(m):
+            if isinstance(m, nn.Linear):
+                trunc_normal_(m.weight, std=.02)
+                if isinstance(m, nn.Linear) and m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.constant_(m.bias, 0)
+                nn.init.constant_(m.weight, 1.0)
+
+        self.apply(_init_weights)
+        # initialize S_Adapter
+        for n, m in self.named_modules():
+            if 'S_Adapter' in n:
+                for n2, m2 in m.named_modules():
+                    if 'D_fc2' in n2:
+                        if isinstance(m2, nn.Linear):
+                            nn.init.constant_(m2.weight, 0)
+                            nn.init.constant_(m2.bias, 0)
+        # initialize MLP_Adapter
+        for n, m in self.named_modules():
+            if 'MLP_Adapter' in n:
+                for n2, m2 in m.named_modules():
+                    if 'D_fc2' in n2:
+                        if isinstance(m2, nn.Linear):
+                            nn.init.constant_(m2.weight, 0)
+                            nn.init.constant_(m2.bias, 0)
 
     def forward(self, x):
         # x: video, size = [B, T, C, H, W]
@@ -61,22 +93,21 @@ class ViT_video(nn.Module):
         x = rearrange(x, 'b c t h w -> (b t) c h w')
         x, x_shape = self.ViT.forward_patch(x, is_shape_info=True)
         _, nx, _ = x.shape
-        x = rearrange(x, '(b t) n d -> (b n) t d', t=T)
-        x = x + self.video_temporal_embedding
-        x = rearrange(x, '(b n) t d -> (b t) n d', n=nx)
 
         for idx_layer, blk in enumerate(self.ViT.v.blocks):
-            xt = rearrange(x, '(b t) n d -> (b n) t d', t=T)
-            xt = self.T_Adapter[idx_layer](blk.drop_path1(blk.ls1(blk.attn(blk.norm1(xt)))))
-            xt = rearrange(xt, '(b n) t d -> (b t) n d', n=nx)
-            x = x + xt
-
             x_attn = self.S_Adapter[idx_layer](blk.drop_path1(blk.ls1(blk.attn(blk.norm1(x)))))
             x = x + x_attn
 
-            x_ffn = blk.drop_path2(blk.ls2(blk.mlp(blk.norm2(x))))
-            x = x + x_ffn + self.MLP_Adapter[idx_layer](x_ffn)
+            x_norm = blk.norm2(x)
+            x_ffn = blk.drop_path2(blk.ls2(blk.mlp(x_norm)))
+            x = x + x_ffn + self.drop_path(self.MLP_Adapter[idx_layer](x_norm))
 
         x = self.ViT.v.norm(x)
         x_cls = x[:, 0, :]
-        return x_cls
+        x_cls = rearrange(x_cls, '(b t) d -> b t d', t=T)
+        x_cls = torch.cat([self.video_cls.expand(x_cls.shape[0], -1, -1), x_cls], dim=1)
+        x_cls = x_cls + self.video_temporal_embedding
+        x_cls = self.video_attn(x_cls)
+        v_cls = x_cls[:, 0, :]
+
+        return v_cls

@@ -2,8 +2,9 @@ import argparse
 import datetime
 import json
 import time
-
+import clip
 import yaml
+import math
 import torch
 import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
@@ -13,22 +14,40 @@ from torch.cuda.amp import autocast, GradScaler
 from torch.utils.data import DataLoader
 from torchvision import transforms
 from transformers import get_cosine_schedule_with_warmup
-
+from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 import utils.utils as utils
 from dataset.preprocess_dataset_MAFW import *
 from dataset.video_dataloader import ImageAudioDataset
-from model.model import AIM
+from model.model import AIM, VideoClip
 from utils.randaugment import RandomAugment
+from utils.mixup import Mixup
 from functools import partial
 from dataset.data_preprocess import ResizeLongestSideAndPad
 from PIL import Image, ImageFile
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
-def create_optimizer_and_scheduler(model, total_steps, warmup_steps):
-    # Use AdamW optimizer
-    optimizer = optim.AdamW(model.parameters(), lr=5e-4, weight_decay=0.05)
 
-    # Use cosine scheduler with warmup
+def create_optimizer_and_scheduler(model, total_steps, warmup_steps):
+    no_decay_param = ['class_embedding', 'temporal_embedding', 'temporal_cls']
+    params_decay = []
+    params_no_decay = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if any(p_name in name for p_name in no_decay_param):
+            params_no_decay.append(param)
+        else:
+            params_decay.append(param)
+    optimizer_grouped_parameters = [
+        {
+            'params': params_decay,
+            'weight_decay': 0.02
+        },
+        {
+            'params': params_no_decay,
+        }
+    ]
+    optimizer = optim.AdamW(optimizer_grouped_parameters, lr=1e-5)
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps=warmup_steps,
@@ -42,7 +61,7 @@ def filter_grad_parameters(model):
     return grad_params
 
 
-def train(model, data_loader, optimizer, epoch, warmup_steps, device, scheduler):
+def train(model, data_loader, optimizer, epoch, mixup_fn, device, scheduler):
     # Train
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=50, fmt='{value:.6f}'))
@@ -51,23 +70,25 @@ def train(model, data_loader, optimizer, epoch, warmup_steps, device, scheduler)
     print_freq = len(data_loader) // 4
     scaler = GradScaler()
     model.train()
-    accumulation_steps = 1
-
+    accumulation_steps = 4
+    num_iters = len(data_loader)
     for i, sample in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
-        optimizer.zero_grad()
-        image = sample["video"].to(device, non_blocking=True)
-        label = sample["label"].to(device, non_blocking=True)
+        ori_image = sample["video"].to(device, non_blocking=True)
+        ori_label = sample["label"].to(device, non_blocking=True)
+        image, label = mixup_fn(ori_image, ori_label)
 
+        remain = num_iters - i
+        cur_accum = accumulation_steps if remain > accumulation_steps else remain
         with autocast():
             loss = model(image, label)
-            loss = loss / accumulation_steps
+            loss = loss / cur_accum
 
         scaler.scale(loss).backward()
-        if (i + 1) % accumulation_steps == 0 or (i + 1) == len(data_loader):
+        if ((i + 1) % accumulation_steps == 0) or ((i + 1) == num_iters):
             scaler.step(optimizer)
             scaler.update()
-            optimizer.zero_grad()
             scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
 
         metric_logger.update(loss=loss.item())
         metric_logger.update(lr=scheduler.get_last_lr()[0])
@@ -102,12 +123,12 @@ def main():
     cudnn.benchmark = True
     with open("./config/AIM.yaml", "r") as f:
         config = yaml.safe_load(f)
-
     start_epoch = 0
-    max_epoch = 50
+    max_epoch = 100
     warmup_steps = 1e-5
 
     print("Creating dataset")
+    _, preprocess = clip.load("ViT-B/16", device=device)
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     pretrain_transform = transforms.Compose([
         transforms.Resize((224, 224)),
@@ -122,20 +143,23 @@ def main():
     ])
 
     dataset_info = run_preprocessing(config, mode='train')
-    dataset = ImageAudioDataset(config, dataset_info, pretrain_transform)
+    dataset = ImageAudioDataset(config, dataset_info, preprocess)
     batch_size = config["train"]["batch_size"]
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True, drop_last=True)
 
     val_dataset_info = run_preprocessing(config, mode='val')
-    val_dataset = ImageAudioDataset(config, val_dataset_info, val_transform, mode='val')
-    val_dataloader = DataLoader(val_dataset, batch_size=4, shuffle=False, num_workers=2, pin_memory=False)
+    val_dataset = ImageAudioDataset(config, val_dataset_info, preprocess, mode='val')
+    val_dataloader = DataLoader(val_dataset, batch_size=4, shuffle=False, num_workers=4, pin_memory=False)
 
     print("Creating model")
-    model = AIM(config)
+    # model = AIM(config)
+    criterion = SoftTargetCrossEntropy()
+    model = VideoClip(loss_fn=criterion)
     model = model.to(device)
 
-    total_steps = int(len(dataloader) * max_epoch)
-    warmup_steps = int(len(dataloader) * 2)
+    steps_per_epoch = math.ceil(len(dataloader) / 4)
+    total_steps = steps_per_epoch * max_epoch
+    warmup_steps = steps_per_epoch * 5
 
     optimizer, scheduler = create_optimizer_and_scheduler(model, total_steps, warmup_steps)
 
@@ -158,6 +182,12 @@ def main():
     output_dir = config["train"]["output_dir"]
     os.makedirs(output_dir, exist_ok=True)
 
+    mixup_fn = Mixup(
+        mixup_alpha=0.8, cutmix_alpha=1.0, cutmix_minmax=None,
+        prob=1.0, switch_prob=0.5, mode='batch',
+        label_smoothing=0.1, num_classes=11)
+
+
     print("Start training")
     start_time = time.time()
 
@@ -167,7 +197,7 @@ def main():
     for epoch in range(start_epoch, max_epoch):
         # if early_stop >= 5:
         #     break
-        train_stats = train(model, dataloader, optimizer, epoch, warmup_steps, device, scheduler)
+        train_stats = train(model, dataloader, optimizer, epoch, mixup_fn, device, scheduler)
         if utils.is_main_process():
             log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                          'epoch': epoch}
