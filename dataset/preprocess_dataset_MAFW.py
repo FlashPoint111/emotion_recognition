@@ -27,7 +27,7 @@ def run_preprocessing(config, mode):
             video_file, label = video_info.strip().split(' ')
             if video_file in ban_list:
                 continue
-            video_path = os.path.join(dataset_dir, video_file.replace('.mp4', '.wav'))
+            video_path = os.path.join(dataset_dir) #, video_file.replace('.mp4', '.wav'))
             frame_path = os.path.join(dataset_frames_dir, video_file.split('.')[0])
             with open(os.path.join(frame_path, "n_frames"), 'r') as f:
                 frame_num = int(f.read())

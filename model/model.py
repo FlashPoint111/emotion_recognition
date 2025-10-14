@@ -127,7 +127,7 @@ class VideoClip(nn.Module):
         print(f"Trainable ratio: {100 * num_trainable / total_params:.2f}%")
 
     def forward(self, x, label=None):
-        x, is_ordered = self.video_encoder(x)
+        x = self.video_encoder(x)
         '''x = rearrange(x, '(b t) d -> b d t', t=16)
         x = x.unsqueeze(-1).unsqueeze(-1)
         x = self.avg_pool(x)
