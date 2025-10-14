@@ -64,19 +64,26 @@ def extract_video(clip_path: str,
                   frames_per_segment,
                   segments: int = 8,
                   mode: str = 'train',
+                  chunk_nb=None,
+                  split_nb=None
                   ):
     interval_length = frame_num // segments
     frames_idx = []
     if mode == 'train':
-        for i in range(segments):
-            interval_start = i * interval_length
-            interval_end = interval_start + interval_length if interval_start + interval_length < frame_num else frame_num
-            frames_idx.extend(
-                np.random.choice(np.arange(interval_start, interval_end), size=frames_per_segment, replace=False))
-        frames_idx = sorted(frames_idx)
+        converted_len = 16
+        seg_len = frame_num
+
+        if seg_len <= converted_len:
+            frames_idx = np.arange(seg_len)
+            frames_idx = np.concatenate((frames_idx, np.ones(16 - seg_len) * (seg_len - 1)))
+        else:
+            end_idx = np.random.randint(converted_len, seg_len)
+            str_idx = end_idx - converted_len
+            frames_idx = np.arange(str_idx, end_idx)
+
     else:
-        frames_idx = np.linspace(0, frame_num, int(segments * frames_per_segment + 2), dtype=int)
-        frames_idx = frames_idx[1:-1]
+        frames_idx = np.arange(frame_num)
+
     video = []
     for idx in frames_idx:
         frame_idx = os.path.join(clip_path, str(idx).zfill(4) + ".png")
@@ -86,30 +93,51 @@ def extract_video(clip_path: str,
                 video.append(image)
         except Exception as e:
             print(f"Error loading {frame_idx}: {e}")
+
     if mode == 'train':
         data_resize = video_transforms.Compose([
-            video_transforms.Resize(size=(256, 256))
+            video_transforms.Resize(size=(224, 224))
         ])
         video = data_resize(video)
         video = _aug_frame(video)
+        return video
     else:
-        data_transform = video_transforms.Compose([
-            video_transforms.Resize(size=(256, 256), interpolation='bilinear'),
-            video_transforms.CenterCrop(size=(224, 224)),
-            volume_transforms.ClipToTensor(),
-            video_transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
-                                       std=[0.26862954, 0.26130258, 0.27577711])
+        test_num_crop = 2
+        test_num_segment = 2
+        data_resize = video_transforms.Compose([
+            video_transforms.Resize(size=(224, 224), interpolation='bilinear')
         ])
+        video = data_resize(video)
+        if isinstance(video, list):
+            video = np.stack(video, 0)
+        spatial_step = 1.0 * (max(video.shape[1], video.shape[2]) - 224) \
+                       / (test_num_crop - 1)
+        temporal_step = max(1.0 * (video.shape[0] - 16) \
+                            / (test_num_segment - 1), 0)
+        temporal_start = int(chunk_nb * temporal_step)
+        spatial_start = int(split_nb * spatial_step)
+        if video.shape[1] >= video.shape[2]:
+            video = video[temporal_start:temporal_start + 16, \
+                    spatial_start:spatial_start + 224, :, :]
+        else:
+            video = video[temporal_start:temporal_start + 16, \
+                    :, spatial_start:spatial_start + 224, :]
+
+        data_transform = video_transforms.Compose([
+                volume_transforms.ClipToTensor(),
+                video_transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
+                                           std=[0.26862954, 0.26130258, 0.27577711])
+            ])
         video = data_transform(video)
-    return video
+        return video
 
 
 def _aug_frame(buffer):
     aug_transform = video_transforms.create_random_augment(
-            input_size=(224, 224),
-            auto_augment='rand-m7-n4-mstd0.5-inc1',
-            interpolation='bicubic',
-        )
+        input_size=(224, 224),
+        auto_augment='rand-m7-n4-mstd0.5-inc1',
+        interpolation='bicubic',
+    )
 
     buffer = aug_transform(buffer)
 
@@ -158,16 +186,16 @@ def _aug_frame(buffer):
 
 
 def spatial_sampling(
-    frames,
-    spatial_idx=-1,
-    min_scale=256,
-    max_scale=320,
-    crop_size=224,
-    random_horizontal_flip=True,
-    inverse_uniform_sampling=False,
-    aspect_ratio=None,
-    scale=None,
-    motion_shift=False,
+        frames,
+        spatial_idx=-1,
+        min_scale=256,
+        max_scale=320,
+        crop_size=224,
+        random_horizontal_flip=True,
+        inverse_uniform_sampling=False,
+        aspect_ratio=None,
+        scale=None,
+        motion_shift=False,
 ):
     """
     Perform spatial sampling on the given video frames. If spatial_idx is
@@ -262,19 +290,46 @@ class ImageAudioDataset(Dataset):
         self.frames_per_segment = 1
         self.audio_mean = -8.4043
         self.audio_std = 4.6940
+        if self.mode != 'train':
+            self.test_num_segment = 1
+            self.test_num_crop = 1
+            self.test_seg = []
+            self.test_dataset = []
+            self.test_label_array = []
+            self.test_dataset_frame_num = []
+            for ck in range(self.test_num_segment):
+                for cp in range(self.test_num_crop):
+                    for idx in range(len(self.dataset_info)):
+                        sample = self.dataset_info[idx]
+                        self.test_label_array.append(sample['label'])
+                        self.test_dataset.append(sample['frame_path'])
+                        self.test_dataset_frame_num.append(sample['frame_num'])
+                        self.test_seg.append((ck, cp))
 
     def __getitem__(self, idx):
-        sample = self.dataset_info[idx]
-        video_path = sample['video_path']
-        frame_path = sample['frame_path']
-        frame_num = sample['frame_num']
-        label = sample['label']
-        video = extract_video(frame_path, self.image_transform, frame_num, self.frames_per_segment, self.segments,
-                              self.mode)
-        return {'video': video, 'label': label}
+        if self.mode == 'train':
+            sample = self.dataset_info[idx]
+            video_path = sample['video_path']
+            frame_path = sample['frame_path']
+            frame_num = sample['frame_num']
+            label = sample['label']
+            video = extract_video(frame_path, self.image_transform, frame_num, self.frames_per_segment, self.segments,
+                                  self.mode)
+            return {'video': video, 'label': label}
+        else:
+            frame_path = self.test_dataset[idx]
+            label = self.test_label_array[idx]
+            frame_num = self.test_dataset_frame_num[idx]
+            chunk_nb, split_nb = self.test_seg[idx]
+            video = extract_video(frame_path, self.image_transform, frame_num, self.frames_per_segment, self.segments,
+                                  self.mode, chunk_nb, split_nb)
+            return {'frame': frame_path.split('\\')[-1], 'video': video, 'label': label}
 
     def __len__(self):
-        return len(self.dataset_info)
+        if self.mode == 'train':
+            return len(self.dataset_info)
+        else:
+            return len(self.test_dataset)
 
 
 def img_process(img: Image, transform: transforms.Compose):

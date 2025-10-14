@@ -67,7 +67,7 @@ class AIM(nn.Module):
             if 'ViT' in name or 'swin' in name:
                 param.requires_grad = False
                 total_params += tmp
-                if 'cls_token' in name or 'v.norm' in name:
+                if 'v.norm' in name:
                     param.requires_grad = True
                     train_params += tmp
 

@@ -52,11 +52,13 @@ class ViT_video(nn.Module):
         self.MLP_Adapter = nn.ModuleList(
             [Adapter(d_model, mlp_ratio=0.25, skip_connect=False) for d_model in hidden_list])
 
-        self.video_temporal_embedding = nn.Parameter(torch.zeros(1, 17, 768) * .02)
+        self.video_temporal_embedding = nn.Parameter(torch.zeros(1, 17, 768))
         self.scale = 768 ** -0.5
-        self.drop_path = DropPath(0.2)
-        self.video_cls = nn.Parameter(torch.randn(1, 1, 768) * .02)
+        self.drop_path = DropPath(0.1)
+        self.video_cls = nn.Parameter(torch.zeros(1, 1, 768))
         self.video_attn = Attention(768)
+        trunc_normal_(self.video_cls, std=.02)
+        nn.init.normal_(self.video_temporal_embedding, std=1e-6)
 
 
     def init_weights(self, pretrained=None):

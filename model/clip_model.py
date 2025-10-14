@@ -127,7 +127,7 @@ class VisionTransformer(nn.Module):
         x = rearrange(x, '(b t) d -> b t d', b=B, t=T)
         x = torch.cat([self.temporal_cls.expand(x.shape[0], -1, -1), x], dim=1)
         x = x + self.temporal_embedding
-        x = x + self.droppath(self.temporal_attn(self.temporal_norm(x)))
+        x = self.temporal_attn(self.temporal_norm(x))
         x = x[:, 0, :]
 
         return x

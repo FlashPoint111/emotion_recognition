@@ -219,8 +219,8 @@ def main():
             #     early_stop += 1
             with open(os.path.join(output_dir, "log.txt"), "a") as f:
                 f.write(json.dumps(log_stats) + "\n")
-    label, prediction = eval(model, val_dataloader, device)
-    print(classification_report(label.numpy(), prediction.numpy()))
+    # label, prediction = eval(model, val_dataloader, device)
+    # print(classification_report(label.numpy(), prediction.numpy()))
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
