@@ -18,7 +18,8 @@ def run_preprocessing(config, mode):
                 "disappointment", "neutral"]
     preprocessed_data = []
     ban_list = ['00903.mp4', '03414.mp4', '03724.mp4', '03727.mp4', '03810.mp4', '03931.mp4', '03440.mp4', '03721.mp4',
-                '03728.mp4', '03855.mp4', '03928.mp4', '03732.mp4', '03927.mp4', '09529.mp4', '03730.mp4', '03726.mp4']
+                '03728.mp4', '03855.mp4', '03928.mp4', '03732.mp4', '03927.mp4', '09529.mp4', '03730.mp4', '03726.mp4',
+                '03325.mp4', '03382.mp4', '03731.mp4', '03807.mp4', '03816.mp4']
 
     with open(dataset_info_dir, 'r') as f:
         info = f.readlines()
@@ -27,12 +28,15 @@ def run_preprocessing(config, mode):
             video_file, label = video_info.strip().split(' ')
             if video_file in ban_list:
                 continue
-            video_path = os.path.join(dataset_dir) #, video_file.replace('.mp4', '.wav'))
+            video_path = os.path.join(dataset_dir, video_file.replace('.mp4', '.flac'))
             frame_path = os.path.join(dataset_frames_dir, video_file.split('.')[0])
-            with open(os.path.join(frame_path, "n_frames"), 'r') as f:
-                frame_num = int(f.read())
-                if frame_num < 3:
-                    continue
+            if os.path.exists(os.path.join(frame_path, "n_frames")):
+                with open(os.path.join(frame_path, "n_frames"), 'r') as f:
+                    frame_num = int(f.read())
+            else:
+                frame_num = len(os.listdir(frame_path))
+            if frame_num < 3:
+                continue
             label_idx = emotions.index(label)
 
             video_info = {

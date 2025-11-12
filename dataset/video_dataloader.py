@@ -3,6 +3,7 @@ import torchaudio
 from PIL import ImageFile
 from torch.utils.data import Dataset
 from torchvision import transforms
+import math
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 from .random_erasing import RandomErasing
@@ -10,52 +11,37 @@ from dataset.preprocess_dataset_MAFW import *
 from dataset.preprocess_utils import *
 from . import video_transforms
 from . import volume_transforms
+from dataset.audio_data import get_audio_features, int16_to_float32, float32_to_int16
 
 
 def extract_audio(audio_path: str,
-                  mean: float,
-                  std: float,
-                  mode: str,
-                  segments: int = 8,
+                  str_idx: int,
+                  end_idx: int,
+                  frame_idx: int,
+                  sr=48000
                   ):
     # Read the audio file and create its log-Mel spectrum.
-    # audio, _ = (
-    #     ffmpeg
-    #     .input(audio_path)
-    #     .output('pipe:', format='wav', ac=1, ar=16000)
-    #     .run(capture_stdout=True, capture_stderr=True)
-    # )
-    waveform, sr = torchaudio.load(audio_path)
-    waveform = waveform.mean(dim=0, keepdim=True)
-    waveform = waveform - waveform.mean()
-    mel_spectrogram = torchaudio.compliance.kaldi.fbank(waveform, htk_compat=True, sample_frequency=sr,
-                                                        use_energy=False, window_type='hanning',
-                                                        num_mel_bins=128,
-                                                        dither=0.0, frame_shift=10).transpose(1, 0)
-    mel_spectrogram = (mel_spectrogram - mean) / (std * 2)
-    audio_len = mel_spectrogram.shape[1]
-    audio_seg_points = np.round(np.linspace(0, audio_len - 1, segments + 1)).astype(int)
-    output = []
-    # freqm = torchaudio.transforms.FrequencyMasking(6)
-    # timem = torchaudio.transforms.TimeMasking(3)
-    for i in range(segments):
-        interval = audio_seg_points[i + 1] - audio_seg_points[i]
-        if interval <= 32:
-            p = 32 - interval
-            m = torch.nn.ZeroPad2d((0, p, 0, 0))
-            block = m(mel_spectrogram[:, audio_seg_points[i]: audio_seg_points[i + 1]])
-        else:
-            if mode == 'train':
-                start_point = audio_seg_points[i] + np.random.randint(0, interval - 32)
-                block = mel_spectrogram[:, start_point:start_point + 32]
-            else:
-                start_point = int((audio_seg_points[i] + audio_seg_points[i + 1]) / 2)
-                block = mel_spectrogram[:, start_point - 16:start_point + 16]
-        # if mode == 'train':
-        #     block = freqm(block)
-        #     block = timem(block)
-        output.append(block)
-    return torch.stack(output, dim=0)
+    audio_waveform, _ = librosa.load(audio_path, sr=sr)
+    audio_waveform = int16_to_float32(float32_to_int16(audio_waveform))
+    audio_waveform = torch.from_numpy(audio_waveform).float()
+    length = len(audio_waveform)
+    start = int(str_idx / (frame_idx - 1) * length)
+    end = int(end_idx / (frame_idx - 1) * length)
+    if start >= end:
+        print(start, end)
+    audio_waveform = audio_waveform[start:end]
+    audio_cfg = {'audio_length': 1024, 'class_num': 527, 'clip_samples': 480000, 'fmax': 14000, 'fmin': 50,
+                 'hop_size': 480, 'mel_bins': 64, 'model_name': 'base', 'model_type': 'HTSAT', 'sample_rate': 48000,
+                 'window_size': 1024}
+    temp_dict = {}
+    temp_dict = get_audio_features(
+        temp_dict, audio_waveform, 480000,
+        data_truncating='rand_trunc',
+        data_filling='repeatpad',
+        audio_cfg=audio_cfg,
+        require_grad=audio_waveform.requires_grad
+    )
+    return temp_dict
 
 
 def extract_video(clip_path: str,
@@ -67,42 +53,49 @@ def extract_video(clip_path: str,
                   chunk_nb=None,
                   split_nb=None
                   ):
+    sr = 4
     interval_length = frame_num // segments
-    frames_idx = []
-    if mode == 'train':
-        converted_len = 16
-        seg_len = frame_num
+    file_list = os.listdir(clip_path)
+    file_list.sort(key=lambda x: int(x[:-4]))
+    frame_list = []
+    clip_num = 16
+    clip_len = clip_num * sr
 
-        if seg_len <= converted_len:
-            frames_idx = np.arange(seg_len)
-            frames_idx = np.concatenate((frames_idx, np.ones(16 - seg_len) * (seg_len - 1)))
+    if mode == 'train' or mode == 'val':
+        if frame_num <= clip_len:
+            index = np.linspace(0, frame_num, num=frame_num // sr)
+            index = np.concatenate((index, np.ones(clip_num - frame_num // sr) * frame_num))
+            index = np.clip(index, 0, frame_num - 1).astype(np.int64)
         else:
-            end_idx = np.random.randint(converted_len, seg_len)
-            str_idx = end_idx - converted_len
-            frames_idx = np.arange(str_idx, end_idx)
+            end_idx = np.random.randint(clip_len, frame_num)
+            str_idx = end_idx - clip_len
+            index = np.linspace(str_idx, end_idx, num=clip_num)
+            index = np.clip(index, str_idx, end_idx - 1).astype(np.int64)
 
     else:
-        frames_idx = np.arange(frame_num)
+        index = [x for x in range(0, frame_num, sr)]
+        while len(index) < clip_num:
+            index.append(index[-1])
 
+
+    frame_list += [file_list[x] for x in index]
     video = []
-    for idx in frames_idx:
-        frame_idx = os.path.join(clip_path, str(idx).zfill(4) + ".png")
+    for idx in frame_list:
+        frame_idx = os.path.join(clip_path, idx)
         try:
             with Image.open(frame_idx) as img:
                 image = img.convert('RGB')
                 video.append(image)
         except Exception as e:
             print(f"Error loading {frame_idx}: {e}")
-
     if mode == 'train':
         data_resize = video_transforms.Compose([
             video_transforms.Resize(size=(224, 224))
         ])
         video = data_resize(video)
         video = _aug_frame(video)
-        return video
-    else:
-        test_num_crop = 2
+        return video, index[0], index[-1]
+    elif mode == 'test':
         test_num_segment = 2
         data_resize = video_transforms.Compose([
             video_transforms.Resize(size=(224, 224), interpolation='bilinear')
@@ -110,26 +103,27 @@ def extract_video(clip_path: str,
         video = data_resize(video)
         if isinstance(video, list):
             video = np.stack(video, 0)
-        spatial_step = 1.0 * (max(video.shape[1], video.shape[2]) - 224) \
-                       / (test_num_crop - 1)
-        temporal_step = max(1.0 * (video.shape[0] - 16) \
-                            / (test_num_segment - 1), 0)
+        temporal_step = max(1.0 * (video.shape[0] - 16) / (test_num_segment - 1), 0)
         temporal_start = int(chunk_nb * temporal_step)
-        spatial_start = int(split_nb * spatial_step)
-        if video.shape[1] >= video.shape[2]:
-            video = video[temporal_start:temporal_start + 16, \
-                    spatial_start:spatial_start + 224, :, :]
-        else:
-            video = video[temporal_start:temporal_start + 16, \
-                    :, spatial_start:spatial_start + 224, :]
+        video = video[temporal_start:temporal_start + 16, ...]
 
         data_transform = video_transforms.Compose([
-                volume_transforms.ClipToTensor(),
-                video_transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
-                                           std=[0.26862954, 0.26130258, 0.27577711])
-            ])
+            volume_transforms.ClipToTensor(),
+            video_transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
+                                       std=[0.26862954, 0.26130258, 0.27577711])
+        ])
         video = data_transform(video)
-        return video
+        return video, index[0], index[-1]
+    elif mode == 'val':
+        data_transform = video_transforms.Compose([
+            video_transforms.Resize(224, interpolation='bilinear'),
+            video_transforms.CenterCrop(size=(224, 224)),
+            volume_transforms.ClipToTensor(),
+            video_transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
+                                       std=[0.26862954, 0.26130258, 0.27577711])
+        ])
+        video = data_transform(video)
+        return video, index[0], index[-1]
 
 
 def _aug_frame(buffer):
@@ -290,43 +284,48 @@ class ImageAudioDataset(Dataset):
         self.frames_per_segment = 1
         self.audio_mean = -8.4043
         self.audio_std = 4.6940
-        if self.mode != 'train':
-            self.test_num_segment = 1
-            self.test_num_crop = 1
+        if self.mode == 'test':
+            self.test_num_segment = 2
             self.test_seg = []
             self.test_dataset = []
+            self.test_clip_dataset = []
             self.test_label_array = []
             self.test_dataset_frame_num = []
             for ck in range(self.test_num_segment):
-                for cp in range(self.test_num_crop):
-                    for idx in range(len(self.dataset_info)):
-                        sample = self.dataset_info[idx]
-                        self.test_label_array.append(sample['label'])
-                        self.test_dataset.append(sample['frame_path'])
-                        self.test_dataset_frame_num.append(sample['frame_num'])
-                        self.test_seg.append((ck, cp))
+                for idx in range(len(self.dataset_info)):
+                    sample = self.dataset_info[idx]
+                    self.test_label_array.append(sample['label'])
+                    self.test_dataset.append(sample['frame_path'])
+                    self.test_clip_dataset.append(sample['video_path'])
+                    self.test_dataset_frame_num.append(sample['frame_num'])
+                    self.test_seg.append(ck)
+            print(len(self.test_seg))
 
     def __getitem__(self, idx):
-        if self.mode == 'train':
+        if self.mode == 'train' or self.mode == 'val':
             sample = self.dataset_info[idx]
             video_path = sample['video_path']
             frame_path = sample['frame_path']
             frame_num = sample['frame_num']
             label = sample['label']
-            video = extract_video(frame_path, self.image_transform, frame_num, self.frames_per_segment, self.segments,
-                                  self.mode)
-            return {'video': video, 'label': label}
+            video, str_idx, end_idx = extract_video(frame_path, self.image_transform, frame_num, self.frames_per_segment,
+                                                    self.segments,
+                                                    self.mode)
+            audio = extract_audio(video_path, str_idx, end_idx, frame_num)
+            return {'video': video, 'audio': audio, 'label': label}
         else:
+            video_path = self.test_clip_dataset[idx]
             frame_path = self.test_dataset[idx]
             label = self.test_label_array[idx]
             frame_num = self.test_dataset_frame_num[idx]
-            chunk_nb, split_nb = self.test_seg[idx]
-            video = extract_video(frame_path, self.image_transform, frame_num, self.frames_per_segment, self.segments,
-                                  self.mode, chunk_nb, split_nb)
-            return {'frame': frame_path.split('\\')[-1], 'video': video, 'label': label}
+            chunk_nb = self.test_seg[idx]
+            video, str_idx, end_idx = extract_video(frame_path, self.image_transform, frame_num, self.frames_per_segment, self.segments,
+                                  self.mode, chunk_nb)
+            audio = extract_audio(video_path, str_idx, end_idx, frame_num)
+            return {'frame': frame_path.split('\\')[-1], 'video': video, 'audio': audio, 'label': label}
 
     def __len__(self):
-        if self.mode == 'train':
+        if self.mode == 'train' or self.mode == 'val':
             return len(self.dataset_info)
         else:
             return len(self.test_dataset)

@@ -1,11 +1,8 @@
-from .clip_model import VisionTransformer
 from .lora_layers import *
 
 import torch
 import torch.nn as nn
 from typing import List
-import clip
-from clip.model import CLIP, build_model
 from torch.cuda.amp import autocast, GradScaler
 from .clip_model import VisionTransformer
 

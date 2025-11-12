@@ -5,7 +5,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
-import clip
+import open_clip
 from einops import rearrange
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 from timm.models.vision_transformer import Attention
@@ -77,9 +77,14 @@ class VisionTransformer(nn.Module):
         self.temporal_cls = nn.Parameter(torch.zeros(1, 1, 768))
         trunc_normal_(self.temporal_cls, std=.02)
         nn.init.normal_(self.temporal_embedding, std=1e-6)
-        self.temporal_norm = LayerNorm(width)
-        self.droppath = DropPath(0.1)
+        self.temporal_attn_norm = LayerNorm(width)
+        self.temporal_mlp_norm = LayerNorm(width)
+        self.final_norm = nn.LayerNorm(width)
+        self.temporal_mlp_fc1 = nn.Linear(width, 512)
+        self.temporal_mlp_fc2 = nn.Linear(512, width)
         self.ln_post = LayerNorm(width)
+        self.act = nn.GELU()
+        self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
 
     def init_weights(self, pretrained=None):
         def _init_weights(m):
@@ -96,10 +101,14 @@ class VisionTransformer(nn.Module):
         if isinstance(self.pretrained, str):
             self.apply(_init_weights)
             ## Load OpenAI CLIP pretrained weights
-            clip_model, preprocess = clip.load("ViT-B/16", device="cpu")
+            clip_model, _, preprocess = open_clip.create_model_and_transforms(
+                "ViT-B-16",
+                pretrained="openai"
+            )
             pretrain_dict = clip_model.visual.state_dict()
+            self.logit_scale = clip_model.logit_scale
             del clip_model
-            del pretrain_dict['proj']
+            # del pretrain_dict['proj']
             msg = self.load_state_dict(pretrain_dict, strict=False)
             print(msg)
             torch.cuda.empty_cache()
@@ -127,7 +136,11 @@ class VisionTransformer(nn.Module):
         x = rearrange(x, '(b t) d -> b t d', b=B, t=T)
         x = torch.cat([self.temporal_cls.expand(x.shape[0], -1, -1), x], dim=1)
         x = x + self.temporal_embedding
-        x = self.temporal_attn(self.temporal_norm(x))
+        x = x + self.temporal_attn(self.temporal_attn_norm(x))
+        x_norm = self.temporal_mlp_norm(x)
+        x = x + self.temporal_mlp_fc2(self.act(self.temporal_mlp_fc1(x_norm)))
         x = x[:, 0, :]
+        x = self.final_norm(x)
+        x_proj = x @ self.proj
 
-        return x
+        return x_proj, x
