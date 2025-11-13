@@ -3,7 +3,7 @@ import argparse
 import datetime
 import json
 import time
-
+import os
 import numpy as np
 import open_clip
 import yaml
@@ -37,6 +37,24 @@ warnings.filterwarnings("ignore")
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
+def _unwrap_model(model):
+    """Return the underlying model, regardless of DDP/DataParallel wrappers."""
+    return model.module if hasattr(model, "module") else model
+
+
+def _clean_state_dict_keys(state_dict):
+    """Remove a leading 'module.' prefix that can appear in multi-GPU checkpoints."""
+    if not state_dict:
+        return state_dict
+    cleaned_state_dict = OrderedDict()
+    for k, v in state_dict.items():
+        if k.startswith('module.'):
+            cleaned_state_dict[k[7:]] = v
+        else:
+            cleaned_state_dict[k] = v
+    return cleaned_state_dict
+
+
 def create_optimizer_and_scheduler(model, total_steps, warmup_steps, last_epoch=-1):
     no_decay_param = ['audio_encoder.norm', 'temporal_embedding', 'temporal_cls', 'ln_post', 'temporal_norm', 'x_norm',
                       'a_norm']
@@ -59,7 +77,7 @@ def create_optimizer_and_scheduler(model, total_steps, warmup_steps, last_epoch=
             'weight_decay': 0.0
         }
     ]
-    optimizer = optim.AdamW(optimizer_grouped_parameters, lr=3e-5)
+    optimizer = optim.AdamW(optimizer_grouped_parameters, lr=5e-5)
     for group in optimizer.param_groups:
         group['initial_lr'] = group['lr']
     scheduler = get_cosine_schedule_with_warmup(
@@ -111,14 +129,14 @@ def train(model, data_loader, optimizer, epoch, mixup_fn, device, scheduler, acc
         else:
             beta, gamma = 1, 0.1
         with autocast(dtype=torch.bfloat16):
-            # loss = model(ori_image, ori_label)
-            loss, loss_v, loss_a, H_v, H_a = model(image, input_dict, label, mixup_lambda=mix_lambda)
+            loss = model(image, label)
+            '''loss, loss_v, loss_a, H_v, H_a = model(image, input_dict, label, mixup_lambda=mix_lambda)
             ori_loss = loss
             loss = beta * loss + gamma * (loss_v + loss_a)
             loss = loss / accum
         H_v_total.append(H_v.cpu().numpy())
         H_a_total.append(H_a.cpu().numpy())
-
+        '''
         loss.backward()
         if (i != 0 or (i + 1) % accumulation_steps == 0) or ((i + 1) == num_iters):
             now_step += 1
@@ -127,12 +145,12 @@ def train(model, data_loader, optimizer, epoch, mixup_fn, device, scheduler, acc
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
 
-        metric_logger.update(loss=ori_loss.item())
+        metric_logger.update(loss=loss.item())
         metric_logger.update(lr=scheduler.get_last_lr()[0])
 
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger.global_avg())
-    print("H_v: {:.4f}, H_a: {:.4f}".format(np.array(H_v_total).mean(), np.array(H_a_total).mean()))
+    # print("H_v: {:.4f}, H_a: {:.4f}".format(np.array(H_v_total).mean(), np.array(H_a_total).mean()))
     return {k: "{:.6f}".format(meter.global_avg) for k, meter in metric_logger.meters.items()}
 
 
@@ -150,7 +168,8 @@ def validate(model, data_loader, device, epoch):
             input_dict[k] = ori_audio[k].to(device, non_blocking=True)
         ori_label = F.one_hot(sample["label"], num_classes=11).to(device, non_blocking=True)
         with torch.no_grad():
-            logits, loss, loss_v, loss_a, H_v, H_a = model(ori_image, input_dict, ori_label, mixup_lambda=None)
+            #logits, loss, loss_v, loss_a, H_v, H_a = model(ori_image, input_dict, ori_label, mixup_lambda=None)
+            logits, loss = model(ori_image, ori_label)
             data_loss.append(loss.item())
         logits_pred = torch.argmax(logits, dim=-1)
         label.extend(sample["label"].cpu().numpy())
@@ -226,7 +245,7 @@ def main():
 
     print("Creating model")
     criterion = SoftTargetCrossEntropy()
-    model = CLAIP(loss_fn=criterion).to(device)
+    model = VideoClip(loss_fn=criterion).to(device)
     if is_distributed:
         model = torch.nn.parallel.DistributedDataParallel(
             model, device_ids=[local_rank], output_device=local_rank
@@ -238,26 +257,33 @@ def main():
 
     resume = config["train"]["resume"]
     checkpoint_path = config["train"]["checkpoint_path"]
+    checkpoint = None
+    optimizer_state_dict = None
+    scheduler_state_dict = None
     if resume:
         if os.path.isfile(checkpoint_path):
             print("=> loading checkpoint '{}'".format(checkpoint_path))
             checkpoint = torch.load(checkpoint_path, map_location='cpu')
-            new_state_dict = OrderedDict()
-            for k, v in checkpoint['model'].items():
-                if k.startswith('module.'):
-                    name = k[7:]
-                    new_state_dict[name] = v
-                else:
-                    new_state_dict[k] = v
-            msg = model.load_state_dict(new_state_dict, strict=False)
+            model_to_load = _unwrap_model(model)
+            cleaned_state_dict = _clean_state_dict_keys(checkpoint['model'])
+            msg = model_to_load.load_state_dict(cleaned_state_dict, strict=False)
             print(msg)
             start_epoch = checkpoint['epoch'] + 1
             print("=> loaded checkpoint '{}' (epoch {})".format(checkpoint_path, checkpoint['epoch']))
-            del checkpoint
+            optimizer_state_dict = checkpoint.get('optimizer')
+            scheduler_state_dict = checkpoint.get('lr_scheduler')
         else:
             print("=> no checkpoint found at '{}'".format(checkpoint_path))
 
     optimizer, scheduler = create_optimizer_and_scheduler(model, total_steps, warmup_steps, last_epoch=start_epoch - 1)
+    if checkpoint is not None:
+        if optimizer_state_dict is not None:
+            msg = optimizer.load_state_dict(optimizer_state_dict)
+            print(msg)
+        if scheduler_state_dict is not None:
+            msg = scheduler.load_state_dict(scheduler_state_dict)
+            print(msg)
+        del checkpoint
 
     output_dir = config["train"]["output_dir"]
     os.makedirs(output_dir, exist_ok=True)
@@ -271,7 +297,6 @@ def main():
     start_time = time.time()
     best_loss = math.inf
     best_uar = 0
-    early_stop_conf = 0
 
     for epoch in range(start_epoch, max_epoch):
         if is_distributed:
@@ -282,10 +307,7 @@ def main():
         if utils.is_main_process():
             log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                          'epoch': epoch}
-            if is_distributed:
-                model_state = model.module.state_dict()
-            else:
-                model_state = model.state_dict()
+            model_state = _unwrap_model(model).state_dict()
             save_obj = {
                 'model': model_state,
                 'optimizer': optimizer.state_dict(),
@@ -299,12 +321,6 @@ def main():
             if uar > best_uar:
                 best_uar = uar
                 torch.save(save_obj, os.path.join(output_dir, 'best_checkpoint.pth'))
-            if loss < best_loss:
-                best_loss = loss
-            else:
-                early_stop_conf += 1
-                if early_stop_conf >= 20:
-                    break
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
