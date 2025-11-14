@@ -31,7 +31,7 @@ from PIL import Image, ImageFile
 from model.utils import get_mix_lambda, do_mixup
 import torch.distributed as dist
 from torch.utils.data.distributed import DistributedSampler
-from sklearn.metrics import balanced_accuracy_score
+from sklearn.metrics import balanced_accuracy_score, classification_report
 from collections import OrderedDict
 warnings.filterwarnings("ignore")
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -130,6 +130,7 @@ def train(model, data_loader, optimizer, epoch, mixup_fn, device, scheduler, acc
             beta, gamma = 1, 0.1
         with autocast(dtype=torch.bfloat16):
             loss = model(image, label)
+            loss = loss / accum
             '''loss, loss_v, loss_a, H_v, H_a = model(image, input_dict, label, mixup_lambda=mix_lambda)
             ori_loss = loss
             loss = beta * loss + gamma * (loss_v + loss_a)
@@ -138,7 +139,7 @@ def train(model, data_loader, optimizer, epoch, mixup_fn, device, scheduler, acc
         H_a_total.append(H_a.cpu().numpy())
         '''
         loss.backward()
-        if (i != 0 or (i + 1) % accumulation_steps == 0) or ((i + 1) == num_iters):
+        if (i != 0 and (i + 1) % accumulation_steps == 0) or ((i + 1) == num_iters) or accumulation_steps == 1:
             now_step += 1
             scaler.step(optimizer)
             scaler.update()
@@ -190,6 +191,7 @@ def validate(model, data_loader, device, epoch):
             all_labels = [item for sublist in gathered_labels for item in sublist]
             all_losses = [item for sublist in gathered_losses for item in sublist]
             uar = balanced_accuracy_score(np.array(all_labels), np.array(all_preds))
+            print(classification_report(np.array(all_labels), np.array(all_preds)))
             data_loss = np.array(all_losses).mean()
             obj = [float(data_loss), float(uar)]
         else:
@@ -198,6 +200,7 @@ def validate(model, data_loader, device, epoch):
         data_loss, uar = obj[0], obj[1]
     else:
         uar = balanced_accuracy_score(np.array(label), np.array(pred))
+        print(classification_report(np.array(label), np.array(pred)))
         data_loss = np.array(data_loss).mean()
 
     return data_loss, uar
@@ -234,32 +237,28 @@ def main():
         train_sampler = DistributedSampler(dataset, shuffle=True, drop_last=True)
         dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, sampler=train_sampler,
                                 num_workers=4, pin_memory=True, drop_last=True)
-        val_sampler = DistributedSampler(val_dataset, shuffle=False, drop_last=True)
+        val_sampler = DistributedSampler(val_dataset, shuffle=False, drop_last=False)
         val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, sampler=val_sampler,
-                                    num_workers=4, pin_memory=True, drop_last=True)
+                                    num_workers=4, pin_memory=True, drop_last=False)
 
     else:
         dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True,
                                 num_workers=4, pin_memory=True, drop_last=True)
-        val_dataloader = DataLoader(val_dataset, batch_size=16, shuffle=False, num_workers=4, pin_memory=True, drop_last=True)
+        val_dataloader = DataLoader(val_dataset, batch_size=16, shuffle=False, num_workers=4, pin_memory=True, drop_last=False)
 
     print("Creating model")
     criterion = SoftTargetCrossEntropy()
     model = VideoClip(loss_fn=criterion).to(device)
-    if is_distributed:
-        model = torch.nn.parallel.DistributedDataParallel(
-            model, device_ids=[local_rank], output_device=local_rank
-        )
-    accumulation_steps = 1
+    accumulation_steps = 4
     steps_per_epoch = math.ceil(len(dataloader) / accumulation_steps)
     total_steps = steps_per_epoch * max_epoch
     warmup_steps = steps_per_epoch * 5
-
     resume = config["train"]["resume"]
     checkpoint_path = config["train"]["checkpoint_path"]
     checkpoint = None
     optimizer_state_dict = None
     scheduler_state_dict = None
+
     if resume:
         if os.path.isfile(checkpoint_path):
             print("=> loading checkpoint '{}'".format(checkpoint_path))
@@ -285,6 +284,11 @@ def main():
             print(msg)
         del checkpoint
 
+    if is_distributed:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=[local_rank], output_device=local_rank
+        )
+
     output_dir = config["train"]["output_dir"]
     os.makedirs(output_dir, exist_ok=True)
 
@@ -301,8 +305,9 @@ def main():
     for epoch in range(start_epoch, max_epoch):
         if is_distributed:
             dataloader.sampler.set_epoch(epoch)
-            val_dataloader.sampler.set_epoch(epoch)
+        model.train()
         train_stats = train(model, dataloader, optimizer, epoch, mixup_fn, device, scheduler, accumulation_steps)
+        model.eval()
         loss, uar = validate(model, val_dataloader, device, epoch)
         if utils.is_main_process():
             log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},

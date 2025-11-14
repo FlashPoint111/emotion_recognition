@@ -12,6 +12,8 @@ from dataset.data_preprocess import ResizeLongestSideAndPad
 import yaml
 from collections import OrderedDict
 from collections import defaultdict
+from train import _unwrap_model, _clean_state_dict_keys, validate
+from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 
 
 if __name__ == '__main__':
@@ -20,39 +22,28 @@ if __name__ == '__main__':
 
     device = torch.device('cuda')
     cudnn.benchmark = True
-    # model = VideoClip(loss_fn=None)
-    model = CLAIP(loss_fn=None)
-    # model = HTSAT(loss_fn=None)
-    model = model.to(device)
-    checkpoint_path = "./output/record/checkpoint_33.pth"
+    criterion = SoftTargetCrossEntropy()
+    model = VideoClip(loss_fn=criterion).to(device)
+    checkpoint_path = "./output/checkpoint_57.pth"
     if os.path.isfile(checkpoint_path):
         print("=> loading checkpoint '{}'".format(checkpoint_path))
         checkpoint = torch.load(checkpoint_path, map_location='cpu')
-        new_state_dict = OrderedDict()
-        for k, v in checkpoint['model'].items():
-            if k.startswith('module.'):
-                name = k[7:]
-                new_state_dict[name] = v
-            else:
-                new_state_dict[k] = v
-        msg = model.load_state_dict(new_state_dict, strict=False)
+        model_to_load = _unwrap_model(model)
+        cleaned_state_dict = _clean_state_dict_keys(checkpoint['model'])
+        msg = model_to_load.load_state_dict(cleaned_state_dict, strict=False)
         print(msg)
         print("=> loaded checkpoint '{}' (epoch {})"
               .format(checkpoint_path, checkpoint['epoch']))
     else:
         print("=> no checkpoint found at '{}'".format(checkpoint_path))
-
-    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    val_transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        normalize,
-    ])
+    preprocess = None
     val_dataset_info = run_preprocessing(config, mode='val')
-    val_dataset = ImageAudioDataset(config, val_dataset_info, val_transform, mode='test')
+    val_dataset = ImageAudioDataset(config, val_dataset_info, preprocess, mode='val')
     val_dataloader = DataLoader(val_dataset, batch_size=16, shuffle=False, num_workers=4, pin_memory=False)
     model.eval()
-    all_labels = []
+    data_loss, uar = validate(model, val_dataloader, device, 0)
+    print(uar)
+    '''all_labels = []
     all_preds = []
     result = {}
 
@@ -66,7 +57,7 @@ if __name__ == '__main__':
             input_dict[k] = ori_audio[k].to(device, non_blocking=True)
         label = sample["label"].to(device, non_blocking=True)
         with torch.no_grad():
-            logits = model(image, input_dict)
+            logits = model(image)
         for j in range(len(frame)):
             temp = {'logits': [], 'label': label[j].cpu()}
             result.setdefault(frame[j], temp)['logits'].append(logits[j].cpu())
@@ -109,4 +100,4 @@ if __name__ == '__main__':
     print(f"UAR (Unweighted Average Recall): {uar:.4f}")
 
     war = accuracy_score(all_labels.numpy(), all_preds.numpy())
-    print(f"WAR (Weighted Average Recall): {war:.4f}")
+    print(f"WAR (Weighted Average Recall): {war:.4f}")'''
