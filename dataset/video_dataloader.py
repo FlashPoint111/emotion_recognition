@@ -61,7 +61,7 @@ def extract_video(clip_path: str,
     clip_num = 16
     clip_len = clip_num * sr
 
-    if mode == 'train' or mode == 'val':
+    if mode == 'train':
         if frame_num <= clip_len:
             index = np.linspace(0, frame_num, num=frame_num // sr)
             index = np.concatenate((index, np.ones(clip_num - frame_num // sr) * frame_num))
@@ -103,9 +103,10 @@ def extract_video(clip_path: str,
         video = data_resize(video)
         if isinstance(video, list):
             video = np.stack(video, 0)
-        temporal_step = max(1.0 * (video.shape[0] - 16) / (test_num_segment - 1), 0)
-        temporal_start = int(chunk_nb * temporal_step)
-        video = video[temporal_start:temporal_start + 16, ...]
+        #temporal_step = max(1.0 * (video.shape[0] - 16) / (test_num_segment - 1), 0)
+        #temporal_start = int(chunk_nb * temporal_step)
+        temporal_start = int(video.shape[0] / 2)
+        video = video[temporal_start-8:temporal_start+8, ...]
 
         data_transform = video_transforms.Compose([
             volume_transforms.ClipToTensor(),
@@ -115,6 +116,8 @@ def extract_video(clip_path: str,
         video = data_transform(video)
         return video, index[0], index[-1]
     elif mode == 'val':
+        temporal_start = int(len(video) / 2)
+        video = video[temporal_start - 8:temporal_start + 8]
         data_transform = video_transforms.Compose([
             video_transforms.Resize(224, interpolation='bilinear'),
             video_transforms.CenterCrop(size=(224, 224)),

@@ -11,6 +11,7 @@ def sup_contra_loss(logits, mask):
     loss = -torch.mean(positive_logits_sum)
     return loss
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
+from peft import get_peft_model, LoraConfig, TaskType
 
 '''
 class AIM(nn.Module):
@@ -112,17 +113,15 @@ class VideoClip(nn.Module):
         # self.avg_pool = nn.AdaptiveAvgPool3d((1, 1, 1))
         # self.dropout = nn.Dropout(0.5)
         # self.fc_cls = nn.Linear(768, 11)
+        prompt = torch.load("./dataset/prompts.pt")
+        self.prompt = nn.Parameter(prompt)
+        self.prompt.requires_grad = False
         for name, param in self.video_encoder.named_parameters():
-            if 'temporal' in name:
+            if 'temporal' in name or 'ln_post' in name or 'final' in name:
                 param.requires_grad = True
             elif 'lora_' not in name:
                 param.requires_grad = False
-        # self.loss_fn = loss_fn if loss_fn is not None else nn.CrossEntropyLoss()
-
-        prompt = torch.load("./dataset/prompts.pt")
-        self.prompt = nn.Parameter(prompt)
-        C, K, _ = self.prompt.shape
-        self.alpha = nn.Parameter(torch.ones((C, K)) / K)
+        self.loss_fn = loss_fn if loss_fn is not None else nn.CrossEntropyLoss()
         self.logit_scale = nn.Parameter(self.video_encoder.logit_scale)
         # self.logit_scale.requires_grad = True
         '''
@@ -134,10 +133,15 @@ class VideoClip(nn.Module):
     def forward(self, x, label=None):
         x_proj, x_feat = self.video_encoder(x)
         x = F.normalize(x_proj, dim=-1)
-        prompt = F.normalize(self.prompt, dim=-1)
-        similarity = (self.logit_scale.exp() * prompt @ x.transpose(-2, -1)).permute(2, 0, 1)
-        logits = (similarity * self.alpha).sum(dim=-1)
-        return logits, x_feat
+        similarity = (self.logit_scale.exp() * x @ self.prompt.transpose(0, 1))
+        if label is not None:
+            ce_loss = self.loss_fn(similarity, label)
+            if not self.training:
+                return similarity, ce_loss
+            else:
+                return ce_loss
+        else:
+            return similarity
 
 
 @dataclass
