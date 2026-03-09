@@ -91,6 +91,7 @@ class VisionTransformer(nn.Module):
         nn.init.zeros_(self.cross_attn_layer.out_proj.bias)
         self.cross_gate1 = nn.Parameter(1e-4 * torch.ones([]))
         self.cross_norm2_layer = nn.LayerNorm(output_dim)
+        self.cross_norm3_layer = nn.LayerNorm(output_dim)
         self.cross_ff_layer = nn.Sequential(
             nn.Linear(output_dim, output_dim * 2),
             nn.GELU(),
@@ -101,6 +102,7 @@ class VisionTransformer(nn.Module):
         nn.init.zeros_(self.cross_ff_layer[-2].weight)
         nn.init.zeros_(self.cross_ff_layer[-2].bias)
         self.cross_gate2 = nn.Parameter(1e-4 * torch.ones([]))
+        self.cross_drop = DropPath(drop_prob=0.5)
 
         self.final_norm = nn.LayerNorm(output_dim)
         self.ln_post = LayerNorm(width)
@@ -184,8 +186,10 @@ class VisionTransformer(nn.Module):
         context, weight = self.context_attn(self.context_q_norm(x_cls), seeds_k, seeds_v)
         x = x_cls + F.sigmoid(self.context_alpha) * context
 
-        x = x + F.tanh(self.cross_gate1) * self.cross_attn_layer(query=self.cross_norm1_layer(x), key=audio, value=audio)[0]
-        x = x + F.tanh(self.cross_gate2) * self.cross_ff_layer(self.cross_norm2_layer(x))
+        cross_attn = self.cross_attn_layer(query=self.cross_norm1_layer(x), key=audio, value=audio)[0]
+        cross_attn = self.cross_norm2_layer(cross_attn)
+        x = x + self.cross_drop(F.tanh(self.cross_gate1) * cross_attn)
+        x = x + F.tanh(self.cross_gate2) * self.cross_ff_layer(self.cross_norm3_layer(x))
 
         x = torch.cat([self.temporal_cls.expand(x.shape[0], -1, -1), x], dim=1)
         x = x + self.temporal_embedding

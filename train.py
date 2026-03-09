@@ -53,11 +53,18 @@ def _clean_state_dict_keys(state_dict):
 def create_optimizer_and_scheduler(model, total_steps, warmup_steps, last_epoch=-1):
     wd = 0.05
 
-    decay, no_decay = [], []
+    audio_params = []
+    decay = []
+    no_decay = []
 
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
+
+        if "audio_encoder" in name:
+            audio_params.append(param)
+            continue
+
         if param.ndim <= 1:
             no_decay.append(param)
             continue
@@ -79,11 +86,12 @@ def create_optimizer_and_scheduler(model, total_steps, warmup_steps, last_epoch=
             decay.append(param)
 
     optimizer_grouped_parameters = [
-        {"params": decay, "weight_decay": wd},
-        {"params": no_decay, "weight_decay": 0.0},
+        {"params": decay, "weight_decay": wd, "lr": 5e-4},
+        {"params": no_decay, "weight_decay": 0.0, "lr": 5e-4},
+        {"params": audio_params, "weight_decay": 0.0, "lr": 1e-5},
     ]
 
-    optimizer = optim.AdamW(optimizer_grouped_parameters, lr=5e-4)
+    optimizer = optim.AdamW(optimizer_grouped_parameters)
     for group in optimizer.param_groups:
         group["initial_lr"] = group["lr"]
 
