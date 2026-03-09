@@ -14,8 +14,8 @@ def run_preprocessing(config, mode):
     else:
         dataset_info_dir = config["test"]['label_dir']
 
-    emotions = ["anger", "disgust", "fear", "happiness", "sadness", "surprise", "contempt", "anxiety", "helplessness",
-                "disappointment", "neutral"]
+    emotions = ["anger", "disgust", "fear", "happiness", "neutral", "sadness", "surprise", "contempt", "anxiety", "helplessness",
+                "disappointment"]
     preprocessed_data = []
     ban_list = ['00903.mp4', '03414.mp4', '03724.mp4', '03727.mp4', '03810.mp4', '03931.mp4', '03440.mp4', '03721.mp4',
                 '03728.mp4', '03855.mp4', '03928.mp4', '03732.mp4', '03927.mp4', '09529.mp4', '03730.mp4', '03726.mp4',

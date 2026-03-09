@@ -72,20 +72,44 @@ class VisionTransformer(nn.Module):
         self.ln_pre = LayerNorm(width)
 
         self.transformer = Transformer(width, layers, heads)
-        self.temporal_embedding = nn.Parameter(torch.zeros(1, 17, width))
-        self.temporal_attn = Attention(768)
-        self.temporal_cls = nn.Parameter(torch.zeros(1, 1, 768))
+        self.temporal_embedding = nn.Parameter(torch.zeros(1, 17, output_dim))
+        self.temporal_cls = nn.Parameter(torch.zeros(1, 1, output_dim))
         trunc_normal_(self.temporal_cls, std=.02)
         nn.init.normal_(self.temporal_embedding, std=1e-6)
-        self.temporal_attn_norm = LayerNorm(width)
-        self.temporal_mlp_norm = LayerNorm(width)
-        self.final_norm = nn.LayerNorm(width)
-        self.temporal_mlp_fc1 = nn.Linear(width, 512)
-        self.temporal_mlp_fc2 = nn.Linear(512, width)
-        self.ln_post = LayerNorm(width)
-        self.act = nn.GELU()
-        self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
+        self.temporal_transformer_layer = nn.TransformerEncoderLayer(
+            d_model=512,
+            nhead=8,
+            dim_feedforward=1024,
+            dropout=0.,
+            batch_first=True,
+            norm_first=True
+        )
 
+        self.cross_norm1_layer = nn.LayerNorm(output_dim)
+        self.cross_attn_layer = nn.MultiheadAttention(output_dim, 8, batch_first=True)
+        nn.init.zeros_(self.cross_attn_layer.out_proj.weight)
+        nn.init.zeros_(self.cross_attn_layer.out_proj.bias)
+        self.cross_gate1 = nn.Parameter(1e-4 * torch.ones([]))
+        self.cross_norm2_layer = nn.LayerNorm(output_dim)
+        self.cross_ff_layer = nn.Sequential(
+            nn.Linear(output_dim, output_dim * 2),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(output_dim * 2, output_dim),
+            nn.Dropout(0.1),
+        )
+        nn.init.zeros_(self.cross_ff_layer[-2].weight)
+        nn.init.zeros_(self.cross_ff_layer[-2].bias)
+        self.cross_gate2 = nn.Parameter(1e-4 * torch.ones([]))
+
+        self.final_norm = nn.LayerNorm(output_dim)
+        self.ln_post = LayerNorm(width)
+        self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
+        self.context_attn = nn.MultiheadAttention(512, 8, batch_first=True)
+        self.context_alpha = nn.Parameter(torch.zeros([]))
+        self.context_seed_norm = LayerNorm(output_dim)
+        self.context_q_norm = LayerNorm(output_dim)
+        
     def init_weights(self, pretrained=None):
         def _init_weights(m):
             if isinstance(m, nn.Linear):
@@ -117,7 +141,7 @@ class VisionTransformer(nn.Module):
         else:
             raise TypeError('pretrained must be a str or None')
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, audio: torch.Tensor):
         B, C, T, H, W = x.shape
         x = rearrange(x, 'b c t h w -> (b t) c h w')
         x = self.conv1(x)  # shape = [*, width, grid, grid]
@@ -130,17 +154,43 @@ class VisionTransformer(nn.Module):
         x = x.permute(1, 0, 2)  # NLD -> LND
         x = self.transformer(x)
         x = x.permute(1, 0, 2)  # LND -> NLD
-
+        '''
         x = self.ln_post(x[:, 0, :])
-
         x = rearrange(x, '(b t) d -> b t d', b=B, t=T)
+        '''
+        x_cls_raw = self.ln_post(x[:, 0, :])
+        x = torch.cat([x_cls_raw.unsqueeze(1), x[:, 1:, :]], dim=1)
+        x = x @ self.proj
+
+        x_l2 = F.normalize(x, dim=-1)
+        x_cls = x[:, 0, :]
+        x_patch = x[:, 1:, :]
+
+        scores = (x_l2[:, 1:, :] * x_l2[:, 0, :].unsqueeze(1)).sum(dim=-1)
+        idx = scores.topk(k=8, dim=-1, largest=True, sorted=False).indices
+        seeds = torch.gather(
+            x_patch,  # [B,T,N,D]
+            dim=1,
+            index=idx.unsqueeze(-1).expand(-1, -1, x_patch.size(-1))
+        )
+
+        seeds = self.context_seed_norm(seeds)
+        x_cls = rearrange(x_cls, '(b t) d -> b t d', b=B, t=T)
+        seeds_k = rearrange(seeds, '(b t) k d -> b t k d', b=B, t=T)
+        seeds_k = seeds_k + self.temporal_embedding[:, 1:, :].unsqueeze(2)
+        seeds_k = rearrange(seeds_k, 'b t k d -> b (t k) d', b=B, t=T)
+        seeds_v = rearrange(seeds, '(b t) k d -> b (t k) d', b=B, t=T)
+
+        context, weight = self.context_attn(self.context_q_norm(x_cls), seeds_k, seeds_v)
+        x = x_cls + F.sigmoid(self.context_alpha) * context
+
+        x = x + F.tanh(self.cross_gate1) * self.cross_attn_layer(query=self.cross_norm1_layer(x), key=audio, value=audio)[0]
+        x = x + F.tanh(self.cross_gate2) * self.cross_ff_layer(self.cross_norm2_layer(x))
+
         x = torch.cat([self.temporal_cls.expand(x.shape[0], -1, -1), x], dim=1)
         x = x + self.temporal_embedding
-        x = x + self.temporal_attn(self.temporal_attn_norm(x))
-        x_norm = self.temporal_mlp_norm(x)
-        x = x + self.temporal_mlp_fc2(self.act(self.temporal_mlp_fc1(x_norm)))
+        x = self.temporal_transformer_layer(x)
         x = x[:, 0, :]
         x = self.final_norm(x)
-        x_proj = x @ self.proj
 
-        return x_proj, x
+        return x

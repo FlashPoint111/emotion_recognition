@@ -103,10 +103,9 @@ def extract_video(clip_path: str,
         video = data_resize(video)
         if isinstance(video, list):
             video = np.stack(video, 0)
-        #temporal_step = max(1.0 * (video.shape[0] - 16) / (test_num_segment - 1), 0)
-        #temporal_start = int(chunk_nb * temporal_step)
-        temporal_start = int(video.shape[0] / 2)
-        video = video[temporal_start-8:temporal_start+8, ...]
+        temporal_step = max(1.0 * (video.shape[0] - 16) / (test_num_segment - 1), 0)
+        temporal_start = int(chunk_nb * temporal_step)
+        video = video[temporal_start:temporal_start+16, ...]
 
         data_transform = video_transforms.Compose([
             volume_transforms.ClipToTensor(),

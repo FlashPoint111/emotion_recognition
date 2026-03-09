@@ -1,6 +1,6 @@
 dataset:
   dir: F:/MAFW/data/clips
-  frames_dir: F:/MAFW/data/frames
+  frames_dir: F:/MAFW/data/frames_crop_aligned
   required_frames: 16
   required_audio_len: 1
   sr: 16000
@@ -8,13 +8,13 @@ dataset:
   label_num: 11
 
 train:
-  label_dir: F:/MAFW/Train & Test Set/single/no_caption/set_2/train.txt
+  label_dir: F:/MAFW/Train & Test Set/single/no_caption/set_1/train.txt
   use_frame: True
   batch_size: 8
-  resume: True
-  checkpoint_path: ./output/checkpoint_49.pth
+  resume: False
+  checkpoint_path: ./output/20260303/checkpoint_42.pth
   output_dir: ./output/
   pretrain_file: F:/mae_face_pretrain_vit_base.pth
 
 test:
-  label_dir: F:/MAFW/Train & Test Set/single/no_caption/set_2/test.txt
+  label_dir: F:/MAFW/Train & Test Set/single/no_caption/set_1/test.txt

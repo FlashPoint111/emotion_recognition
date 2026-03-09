@@ -1,38 +1,33 @@
-import warnings
-import argparse
 import datetime
 import json
-import time
-import os
-import numpy as np
-import open_clip
-import yaml
 import math
+import time
+import warnings
+from collections import OrderedDict
+from contextlib import contextmanager
+
 import torch
 import torch.backends.cudnn as cudnn
+import torch.distributed as dist
 import torch.nn.functional as F
 import torch.optim as optim
-from sklearn.metrics import classification_report, recall_score
+import yaml
+from PIL import ImageFile
+from sklearn.metrics import balanced_accuracy_score, classification_report
+from timm.loss import SoftTargetCrossEntropy
 from torch.cuda.amp import autocast, GradScaler
 from torch.utils.data import DataLoader
-from torchvision import transforms
+from torch.utils.data.distributed import DistributedSampler
 from transformers import get_cosine_schedule_with_warmup
-from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
+
 import utils.utils as utils
 from dataset.preprocess_dataset_MAFW import *
 from dataset.video_dataloader import ImageAudioDataset
-from model.model import AIM, VideoClip, HTSAT, CLAIP
-from torch import nn
-from utils.randaugment import RandomAugment
-from utils.mixup import Mixup
-from functools import partial
-from dataset.data_preprocess import ResizeLongestSideAndPad
-from PIL import Image, ImageFile
+from model.model import CLAIP
 from model.utils import get_mix_lambda, do_mixup
-import torch.distributed as dist
-from torch.utils.data.distributed import DistributedSampler
-from sklearn.metrics import balanced_accuracy_score, classification_report
-from collections import OrderedDict
+from utils.mixup import Mixup
+import copy
+
 warnings.filterwarnings("ignore")
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
@@ -56,30 +51,42 @@ def _clean_state_dict_keys(state_dict):
 
 
 def create_optimizer_and_scheduler(model, total_steps, warmup_steps, last_epoch=-1):
-    no_decay_param = ['audio_encoder.norm', 'temporal_embedding', 'temporal_cls', 'ln_post', 'temporal_norm', 'x_norm',
-                      'a_norm']
-    params_decay = []
-    params_no_decay = []
+    wd = 0.05
+
+    decay, no_decay = [], []
+
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if any(p_name in name for p_name in no_decay_param) or name == 'b':
-            params_no_decay.append(param)
+        if param.ndim <= 1:
+            no_decay.append(param)
+            continue
+
+        if (
+            name.endswith(".bias")
+            or "embedding" in name
+            or "class_embedding" in name
+            or "positional_embedding" in name
+            or "temporal_embedding" in name
+            or "temporal_cls" in name
+            or "logit_scale" in name
+            or "context_alpha" in name
+            or "ctx" in name
+            or "lora_" in name
+        ):
+            no_decay.append(param)
         else:
-            params_decay.append(param)
+            decay.append(param)
+
     optimizer_grouped_parameters = [
-        {
-            'params': params_decay,
-            'weight_decay': 0.05
-        },
-        {
-            'params': params_no_decay,
-            'weight_decay': 0.0
-        }
+        {"params": decay, "weight_decay": wd},
+        {"params": no_decay, "weight_decay": 0.0},
     ]
-    optimizer = optim.AdamW(optimizer_grouped_parameters, lr=5e-5)
+
+    optimizer = optim.AdamW(optimizer_grouped_parameters, lr=5e-4)
     for group in optimizer.param_groups:
-        group['initial_lr'] = group['lr']
+        group["initial_lr"] = group["lr"]
+
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps=warmup_steps,
@@ -87,6 +94,25 @@ def create_optimizer_and_scheduler(model, total_steps, warmup_steps, last_epoch=
         last_epoch=last_epoch
     )
     return optimizer, scheduler
+
+
+def _clone_state_dict_from_training_mode(model):
+    """Snapshot weights while the model is still in training mode.
+
+    The LoRA layers merge their low-rank weights into the main weights when
+    ``eval()`` is called. By cloning tensors before switching modes we avoid
+    saving a merged copy of the parameters, keeping the checkpoint identical to
+    the training-time weights.
+    """
+
+    state_dict = model.state_dict()
+    cloned_state_dict = OrderedDict()
+    for key, value in state_dict.items():
+        if torch.is_tensor(value):
+            cloned_state_dict[key] = value.detach().cpu().clone()
+        else:
+            cloned_state_dict[key] = copy.deepcopy(value)
+    return cloned_state_dict
 
 
 def filter_grad_parameters(model):
@@ -129,15 +155,11 @@ def train(model, data_loader, optimizer, epoch, mixup_fn, device, scheduler, acc
         else:
             beta, gamma = 1, 0.1
         with autocast(dtype=torch.bfloat16):
-            loss = model(image, label)
+            # loss = model(input_dict, mix_lambda, label)
+            loss, neg_loss = model(image, input_dict, label, mix_lambda)
+            loss = loss + neg_loss
             loss = loss / accum
-            '''loss, loss_v, loss_a, H_v, H_a = model(image, input_dict, label, mixup_lambda=mix_lambda)
-            ori_loss = loss
-            loss = beta * loss + gamma * (loss_v + loss_a)
-            loss = loss / accum
-        H_v_total.append(H_v.cpu().numpy())
-        H_a_total.append(H_a.cpu().numpy())
-        '''
+
         loss.backward()
         if (i != 0 and (i + 1) % accumulation_steps == 0) or ((i + 1) == num_iters) or accumulation_steps == 1:
             now_step += 1
@@ -156,54 +178,96 @@ def train(model, data_loader, optimizer, epoch, mixup_fn, device, scheduler, acc
 
 
 def validate(model, data_loader, device, epoch):
-    model.eval()
     data_loss = []
-    pred = []
-    label = []
+    local_result = {}
+
     for i, sample in enumerate(data_loader):
-        ori_image = sample["video"].to(device, non_blocking=True)
+        if "frame" not in sample:
+            raise KeyError(
+                "validate() expects sample['frame'] (use ImageAudioDataset(..., mode='test') for val_dataset)."
+            )
+        frames = sample["frame"]  # usually a list of strings/ids with length = batch_size
+        image = sample["video"].to(device, non_blocking=True)
         ori_audio = sample["audio"]
         input_dict = {}
         keys = ori_audio.keys()
         for k in keys:
             input_dict[k] = ori_audio[k].to(device, non_blocking=True)
-        ori_label = F.one_hot(sample["label"], num_classes=11).to(device, non_blocking=True)
+
+        ori_label_oh = F.one_hot(sample["label"], num_classes=11).to(device, non_blocking=True, dtype=torch.float32)
+
         with torch.no_grad():
-            #logits, loss, loss_v, loss_a, H_v, H_a = model(ori_image, input_dict, ori_label, mixup_lambda=None)
-            logits, loss = model(ori_image, ori_label)
-            data_loss.append(loss.item())
-        logits_pred = torch.argmax(logits, dim=-1)
-        label.extend(sample["label"].cpu().numpy())
-        pred.extend(logits_pred.cpu().numpy())
+            loss, logits = model(image, audio=input_dict, label=ori_label_oh)  # keep val loss behavior same as train.py
+            data_loss.append(float(loss.item()))
+
+        for j in range(len(frames)):
+            key = str(frames[j])
+            y = int(sample["label"][j].item())
+            logit_j = logits[j].detach().float().cpu()  # [C]
+
+            if key not in local_result:
+                local_result[key] = {"logits_sum": logit_j.clone(), "count": 1, "label": y}
+            else:
+                local_result[key]["logits_sum"] += logit_j
+                local_result[key]["count"] += 1
 
     is_distributed = dist.is_available() and dist.is_initialized()
     if is_distributed:
         world_size = dist.get_world_size()
-        gathered_preds = [None] * world_size
-        gathered_labels = [None] * world_size
+        gathered_results = [None] * world_size
         gathered_losses = [None] * world_size
-        dist.all_gather_object(gathered_preds, pred)
-        dist.all_gather_object(gathered_labels, label)
+
+        dist.all_gather_object(gathered_results, local_result)
         dist.all_gather_object(gathered_losses, data_loss)
 
         if utils.is_main_process():
-            all_preds = [item for sublist in gathered_preds for item in sublist]
-            all_labels = [item for sublist in gathered_labels for item in sublist]
-            all_losses = [item for sublist in gathered_losses for item in sublist]
+            merged = {}
+            for rd in gathered_results:
+                for k, v in rd.items():
+                    if k not in merged:
+                        merged[k] = {
+                            "logits_sum": v["logits_sum"].clone(),
+                            "count": int(v["count"]),
+                            "label": int(v["label"]),
+                        }
+                    else:
+                        merged[k]["logits_sum"] += v["logits_sum"]
+                        merged[k]["count"] += int(v["count"])
+
+            all_preds, all_labels = [], []
+            for k, v in merged.items():
+                logits_avg = v["logits_sum"] / max(v["count"], 1)
+                # mimic test.py behavior: softmax then argmax (argmax is identical w/ or w/o softmax)
+                probs = torch.softmax(logits_avg, dim=0)
+                all_preds.append(int(torch.argmax(probs).item()))
+                all_labels.append(int(v["label"]))
+
             uar = balanced_accuracy_score(np.array(all_labels), np.array(all_preds))
             print(classification_report(np.array(all_labels), np.array(all_preds)))
-            data_loss = np.array(all_losses).mean()
-            obj = [float(data_loss), float(uar)]
+
+            all_losses = [x for sub in gathered_losses for x in sub]
+            mean_loss = float(np.mean(all_losses)) if len(all_losses) > 0 else 0.0
+
+            obj = [mean_loss, float(uar)]
         else:
             obj = [0.0, 0.0]
-        dist.broadcast_object_list(obj, src=0)
-        data_loss, uar = obj[0], obj[1]
-    else:
-        uar = balanced_accuracy_score(np.array(label), np.array(pred))
-        print(classification_report(np.array(label), np.array(pred)))
-        data_loss = np.array(data_loss).mean()
 
-    return data_loss, uar
+        dist.broadcast_object_list(obj, src=0)
+        mean_loss, uar = obj[0], obj[1]
+        return mean_loss, uar
+
+    else:
+        all_preds, all_labels = [], []
+        for k, v in local_result.items():
+            logits_avg = v["logits_sum"] / max(v["count"], 1)
+            probs = torch.softmax(logits_avg, dim=0)
+            all_preds.append(int(torch.argmax(probs).item()))
+            all_labels.append(int(v["label"]))
+
+        uar = balanced_accuracy_score(np.array(all_labels), np.array(all_preds))
+        print(classification_report(np.array(all_labels), np.array(all_preds)))
+        mean_loss = float(np.mean(data_loss)) if len(data_loss) > 0 else 0.0
+        return mean_loss, uar
 
 
 def main():
@@ -231,7 +295,7 @@ def main():
     dataset_info = run_preprocessing(config, mode='train')
     dataset = ImageAudioDataset(config, dataset_info, preprocess, mode='train')
     val_dataset_info = run_preprocessing(config, mode='val')
-    val_dataset = ImageAudioDataset(config, val_dataset_info, preprocess, mode='val')
+    val_dataset = ImageAudioDataset(config, val_dataset_info, preprocess, mode='test')
     batch_size = config["train"]["batch_size"]
     if is_distributed:
         train_sampler = DistributedSampler(dataset, shuffle=True, drop_last=True)
@@ -244,12 +308,14 @@ def main():
     else:
         dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True,
                                 num_workers=4, pin_memory=True, drop_last=True)
-        val_dataloader = DataLoader(val_dataset, batch_size=16, shuffle=False, num_workers=4, pin_memory=True, drop_last=False)
+        val_dataloader = DataLoader(val_dataset, batch_size=16, shuffle=False, num_workers=4, pin_memory=True,
+                                    drop_last=False)
 
     print("Creating model")
     criterion = SoftTargetCrossEntropy()
-    model = VideoClip(loss_fn=criterion).to(device)
-    accumulation_steps = 4
+    model = CLAIP(loss_fn=criterion).to(device)
+
+    accumulation_steps = 1 if is_distributed else 4
     steps_per_epoch = math.ceil(len(dataloader) / accumulation_steps)
     total_steps = steps_per_epoch * max_epoch
     warmup_steps = steps_per_epoch * 5
@@ -286,7 +352,7 @@ def main():
 
     if is_distributed:
         model = torch.nn.parallel.DistributedDataParallel(
-            model, device_ids=[local_rank], output_device=local_rank
+            model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True
         )
 
     output_dir = config["train"]["output_dir"]
@@ -307,14 +373,15 @@ def main():
             dataloader.sampler.set_epoch(epoch)
         model.train()
         train_stats = train(model, dataloader, optimizer, epoch, mixup_fn, device, scheduler, accumulation_steps)
+        model_to_save = _unwrap_model(model)
+        unmerged_state_dict = _clone_state_dict_from_training_mode(model_to_save)
         model.eval()
         loss, uar = validate(model, val_dataloader, device, epoch)
         if utils.is_main_process():
             log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                          'epoch': epoch}
-            model_state = _unwrap_model(model).state_dict()
             save_obj = {
-                'model': model_state,
+                'model': unmerged_state_dict,
                 'optimizer': optimizer.state_dict(),
                 'lr_scheduler': scheduler.state_dict(),
                 'epoch': epoch,
@@ -332,6 +399,7 @@ def main():
     print('Training time {}'.format(total_time_str))
     if is_distributed and dist.is_initialized():
         dist.destroy_process_group()
+    os.system("sudo shutdown -h now")
 
 
 if __name__ == '__main__':
