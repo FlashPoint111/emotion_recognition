@@ -10,6 +10,41 @@ from einops import rearrange
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 from timm.models.vision_transformer import Attention
 
+import torch
+import torch.nn as nn
+
+
+class RelativeTemporalBias1D(nn.Module):
+    def __init__(self, num_heads: int, max_frames: int):
+        super().__init__()
+        self.num_heads = num_heads
+        self.max_frames = max_frames
+        self.relative_position_bias_table = nn.Parameter(
+            torch.zeros(2 * max_frames - 1, num_heads)
+        )
+        nn.init.trunc_normal_(self.relative_position_bias_table, std=0.02)
+
+    def forward(
+            self,
+            query_len: int,
+            key_frame_len: int,
+            seeds_per_frame: int,
+    ) -> torch.Tensor:
+        if query_len > self.max_frames or key_frame_len > self.max_frames:
+            raise ValueError(
+                f"query_len={query_len}, key_frame_len={key_frame_len} exceed "
+                f"max_frames={self.max_frames}"
+            )
+        device = self.relative_position_bias_table.device
+        q_pos = torch.arange(query_len, device=device)
+        k_frame_pos = torch.arange(key_frame_len, device=device).repeat_interleave(seeds_per_frame)
+        rel = k_frame_pos.unsqueeze(0) - q_pos.unsqueeze(1)
+        rel = rel + (self.max_frames - 1)
+        bias = self.relative_position_bias_table[rel]
+        bias = bias.permute(2, 0, 1).contiguous()
+        return bias
+
+
 class LayerNorm(nn.LayerNorm):
     """Subclass torch's LayerNorm to handle fp16."""
 
@@ -103,6 +138,7 @@ class VisionTransformer(nn.Module):
         self.final_norm = nn.LayerNorm(output_dim)
         self.ln_post = LayerNorm(width)
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
+        self.context_rel_bias = RelativeTemporalBias1D(num_heads=8, max_frames=16)
         self.context_attn = nn.MultiheadAttention(512, 8, batch_first=True)
         self.context_alpha = nn.Parameter(torch.zeros([]))
         self.context_seed_norm = LayerNorm(output_dim)
@@ -188,16 +224,20 @@ class VisionTransformer(nn.Module):
 
         seeds = self.context_seed_norm(seeds)
         x_cls = rearrange(x_cls, '(b t) d -> b t d', b=B, t=T)
-        seeds_k = rearrange(seeds, '(b t) k d -> b t k d', b=B, t=T)
-        seeds_k = seeds_k + self.temporal_embedding[:, 1:, :].unsqueeze(2)
-        seeds_k = rearrange(seeds_k, 'b t k d -> b (t k) d', b=B, t=T)
-        seeds_v = rearrange(seeds, '(b t) k d -> b (t k) d', b=B, t=T)
+        seeds = rearrange(seeds, '(b t) k d -> b (t k) d', b=B, t=T)
 
-        context, weight = self.context_attn(self.context_q_norm(x_cls), seeds_k, seeds_v)
+        rel_bias = self.context_rel_bias(
+            query_len=T,
+            key_frame_len=T,
+            seeds_per_frame=8
+        )
+
+        rel_bias = rel_bias.repeat(B, 1, 1)
+        context = self.context_attn(self.context_q_norm(x_cls), seeds, seeds, attn_mask=rel_bias, average_attn_weights=False, need_weights=False)
         x = x_cls + F.sigmoid(self.context_alpha) * context
 
         audio = self.cross_drop(audio)
-        cross_attn = self.cross_attn_layer(query=self.cross_norm1_layer(x), key=audio, value=audio)[0]
+        cross_attn = self.cross_attn_layer(query=self.cross_norm1_layer(x), key=audio, value=audio, need_weights=False)
         cross_attn = self.cross_norm2_layer(cross_attn)
         x = x + F.tanh(self.cross_gate1) * cross_attn
         x = x + F.tanh(self.cross_gate2) * self.cross_ff_layer(self.cross_norm3_layer(x))
