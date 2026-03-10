@@ -76,15 +76,8 @@ class HTSAT(nn.Module):
                 new_key = key[len_prefix:]
                 audio_branch_state_dict[new_key] = value
 
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.trunc_normal_(m.weight, std=.02)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.LayerNorm):
-                nn.init.constant_(m.bias, 0)
-                nn.init.constant_(m.weight, 1.0)
-        self.audio_encoder.load_state_dict(audio_branch_state_dict, strict=False)
+        self.audio_norm1 = nn.LayerNorm(512)
+        self.audio_norm2 = nn.LayerNorm(512)
 
         lora_r, lora_alpha, lora_dropout = 4, 8, 0.1
         for layer in self.audio_encoder.layers:
@@ -97,14 +90,24 @@ class HTSAT(nn.Module):
                 # block.attn.proj = proj
                 # block.mlp.fc1 = fc1
                 # block.mlp.fc2 = fc2
+
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.trunc_normal_(m.weight, std=.02)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.constant_(m.bias, 0)
+                nn.init.constant_(m.weight, 1.0)
+
+        self.audio_encoder.load_state_dict(audio_branch_state_dict, strict=False)
+
         for name, param in self.named_parameters():
-            if 'lora_' not in name:
+            if 'lora_' not in name or 'audio_norm' not in name:
                 param.requires_grad = False
             else:
                 param.requires_grad = True
 
-        self.audio_norm1 = nn.LayerNorm(512)
-        self.audio_norm2 = nn.LayerNorm(512)
         self.fc1 = nn.Linear(512, 64)
         self.act = nn.GELU()
         self.fc2 = nn.Linear(64, 512)

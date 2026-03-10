@@ -53,21 +53,12 @@ def _clean_state_dict_keys(state_dict):
 def create_optimizer_and_scheduler(model, total_steps, warmup_steps, last_epoch=-1):
     wd = 0.05
 
-    audio_params = []
-    decay = []
-    no_decay = []
+    group = []
 
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
 
-        if "audio_encoder" in name:
-            audio_params.append(param)
-            continue
-
-        if param.ndim <= 1:
-            no_decay.append(param)
-            continue
 
         if (
             name.endswith(".bias")
@@ -80,16 +71,22 @@ def create_optimizer_and_scheduler(model, total_steps, warmup_steps, last_epoch=
             or "context_alpha" in name
             or "ctx" in name
             or "lora_" in name
-        ):
-            no_decay.append(param)
-        else:
-            decay.append(param)
+        ) or param.ndim <= 1:
+            decay = 0.0
 
-    optimizer_grouped_parameters = [
-        {"params": decay, "weight_decay": wd, "lr": 5e-4},
-        {"params": no_decay, "weight_decay": 0.0, "lr": 5e-4},
-        {"params": audio_params, "weight_decay": 0.0, "lr": 1e-5},
-    ]
+        else:
+            decay = wd
+
+        if "audio_encoder" in name or "cross" in name:
+            lr = 1e-5
+
+        else:
+            lr = 5e-4
+
+        group.append({"params": param, "lr": lr, "weight_decay": decay})
+        print(name, lr, decay)
+
+    optimizer_grouped_parameters = group
 
     optimizer = optim.AdamW(optimizer_grouped_parameters)
     for group in optimizer.param_groups:

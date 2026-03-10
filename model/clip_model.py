@@ -87,20 +87,16 @@ class VisionTransformer(nn.Module):
 
         self.cross_norm1_layer = nn.LayerNorm(output_dim)
         self.cross_attn_layer = nn.MultiheadAttention(output_dim, 8, batch_first=True)
-        nn.init.zeros_(self.cross_attn_layer.out_proj.weight)
-        nn.init.zeros_(self.cross_attn_layer.out_proj.bias)
+
         self.cross_gate1 = nn.Parameter(1e-4 * torch.ones([]))
         self.cross_norm2_layer = nn.LayerNorm(output_dim)
         self.cross_norm3_layer = nn.LayerNorm(output_dim)
         self.cross_ff_layer = nn.Sequential(
             nn.Linear(output_dim, output_dim * 2),
             nn.GELU(),
-            nn.Dropout(0.1),
             nn.Linear(output_dim * 2, output_dim),
-            nn.Dropout(0.1),
         )
-        nn.init.zeros_(self.cross_ff_layer[-2].weight)
-        nn.init.zeros_(self.cross_ff_layer[-2].bias)
+
         self.cross_gate2 = nn.Parameter(1e-4 * torch.ones([]))
         self.cross_drop = DropPath(drop_prob=0.5)
 
@@ -111,6 +107,20 @@ class VisionTransformer(nn.Module):
         self.context_alpha = nn.Parameter(torch.zeros([]))
         self.context_seed_norm = LayerNorm(output_dim)
         self.context_q_norm = LayerNorm(output_dim)
+
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.trunc_normal_(m.weight, std=.02)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.constant_(m.bias, 0)
+                nn.init.constant_(m.weight, 1.0)
+
+        nn.init.zeros_(self.cross_attn_layer.out_proj.weight)
+        nn.init.zeros_(self.cross_attn_layer.out_proj.bias)
+        nn.init.zeros_(self.cross_ff_layer[-1].weight)
+        nn.init.zeros_(self.cross_ff_layer[-1].bias)
         
     def init_weights(self, pretrained=None):
         def _init_weights(m):
@@ -186,9 +196,10 @@ class VisionTransformer(nn.Module):
         context, weight = self.context_attn(self.context_q_norm(x_cls), seeds_k, seeds_v)
         x = x_cls + F.sigmoid(self.context_alpha) * context
 
+        audio = self.cross_drop(audio)
         cross_attn = self.cross_attn_layer(query=self.cross_norm1_layer(x), key=audio, value=audio)[0]
         cross_attn = self.cross_norm2_layer(cross_attn)
-        x = x + self.cross_drop(F.tanh(self.cross_gate1) * cross_attn)
+        x = x + F.tanh(self.cross_gate1) * cross_attn
         x = x + F.tanh(self.cross_gate2) * self.cross_ff_layer(self.cross_norm3_layer(x))
 
         x = torch.cat([self.temporal_cls.expand(x.shape[0], -1, -1), x], dim=1)
