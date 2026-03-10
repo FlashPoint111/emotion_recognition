@@ -71,14 +71,14 @@ def create_optimizer_and_scheduler(model, total_steps, warmup_steps, last_epoch=
             or "context_alpha" in name
             or "ctx" in name
             or "lora_" in name
-        ) or param.ndim <= 1:
+        ):
             decay = 0.0
 
         else:
             decay = wd
 
         if "audio_encoder" in name or "cross" in name:
-            lr = 1e-5
+            lr = 5e-5
 
         else:
             lr = 5e-4
