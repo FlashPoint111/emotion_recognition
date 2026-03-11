@@ -77,7 +77,7 @@ def create_optimizer_and_scheduler(model, total_steps, warmup_steps, last_epoch=
         else:
             decay = wd
 
-        if "audio_encoder" in name or "cross" in name:
+        if "audio_encoder" in name and "lora" in name:
             lr = 5e-5
 
         else:

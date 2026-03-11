@@ -45,6 +45,95 @@ class RelativeTemporalBias1D(nn.Module):
         return bias
 
 
+class CrossPostAudioAdapter(nn.Module):
+    def __init__(
+            self,
+            dim: int = 512,
+            bottleneck: int = 64,
+            film_scale: float = 0.1,
+            gate_max: float = 0.1,
+            audio_dropout: float = 0.3,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.film_scale = film_scale
+        self.gate_max = gate_max
+        self.audio_dropout = audio_dropout
+
+        self.x_norm = LayerNorm(dim)
+        self.a_norm = LayerNorm(dim)
+
+        self.gamma_fc = nn.Linear(dim, dim)
+        self.beta_fc = nn.Linear(dim, dim)
+
+        self.adapter_down = nn.Linear(dim, bottleneck)
+        self.adapter_act = nn.GELU()
+        self.adapter_up = nn.Linear(bottleneck, dim)
+
+        self.gate_fc1 = nn.Linear(dim * 2, dim)
+        self.gate_act = nn.GELU()
+        self.gate_fc2 = nn.Linear(dim, dim)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.zeros_(self.gamma_fc.weight)
+        nn.init.zeros_(self.gamma_fc.bias)
+        nn.init.zeros_(self.beta_fc.weight)
+        nn.init.zeros_(self.beta_fc.bias)
+
+        nn.init.trunc_normal_(self.adapter_down.weight, std=0.02)
+        nn.init.constant_(self.adapter_down.bias, 0.0)
+        nn.init.zeros_(self.adapter_up.weight)
+        nn.init.zeros_(self.adapter_up.bias)
+
+        nn.init.trunc_normal_(self.gate_fc1.weight, std=0.02)
+        nn.init.constant_(self.gate_fc1.bias, 0.0)
+        nn.init.zeros_(self.gate_fc2.weight)
+        nn.init.constant_(self.gate_fc2.bias, -4.0)  # sigmoid(-4) ≈ 0.018
+
+    def _apply_audio_dropout(self, a: torch.Tensor) -> torch.Tensor:
+        if (not self.training) or self.audio_dropout <= 0:
+            return a
+        keep = (torch.rand(a.shape[0], 1, device=a.device) > self.audio_dropout).to(a.dtype)
+        return a * keep
+
+    def forward(self, sample_cls: torch.Tensor, audio_global: torch.Tensor, return_aux: bool = False):
+        if audio_global.dim() == 3:
+            audio_global = audio_global.mean(dim=1)
+
+        x0 = sample_cls
+        x = self.x_norm(sample_cls)
+
+        a = self.a_norm(audio_global)
+        a = self._apply_audio_dropout(a)
+
+        gamma = 1.0 + self.film_scale * torch.tanh(self.gamma_fc(a))  # [B, D]
+        beta = self.film_scale * torch.tanh(self.beta_fc(a))  # [B, D]
+
+        x_mod = gamma * x + beta
+
+        delta = self.adapter_up(self.adapter_act(self.adapter_down(x_mod)))  # [B, D]
+
+        gate_in = torch.cat([x, a], dim=-1)  # [B, 2D]
+        gate = self.gate_max * torch.sigmoid(
+            self.gate_fc2(self.gate_act(self.gate_fc1(gate_in)))
+        )  # [B, D], each dim in (0, gate_max)
+
+        out = x0 + gate * delta
+
+        if return_aux:
+            aux = {
+                "gamma": gamma,
+                "beta": beta,
+                "gate": gate,
+                "delta_norm": delta.norm(dim=-1).mean().detach(),
+                "gate_mean": gate.mean().detach(),
+            }
+            return out, aux
+        return out
+
+
 class LayerNorm(nn.LayerNorm):
     """Subclass torch's LayerNorm to handle fp16."""
 
@@ -120,21 +209,6 @@ class VisionTransformer(nn.Module):
             norm_first=True
         )
 
-        self.cross_norm1_layer = nn.LayerNorm(output_dim)
-        self.cross_attn_layer = nn.MultiheadAttention(output_dim, 8, batch_first=True)
-
-        self.cross_gate1 = nn.Parameter(1e-4 * torch.ones([]))
-        self.cross_norm2_layer = nn.LayerNorm(output_dim)
-        self.cross_norm3_layer = nn.LayerNorm(output_dim)
-        self.cross_ff_layer = nn.Sequential(
-            nn.Linear(output_dim, output_dim * 2),
-            nn.GELU(),
-            nn.Linear(output_dim * 2, output_dim),
-        )
-
-        self.cross_gate2 = nn.Parameter(1e-4 * torch.ones([]))
-        self.cross_drop = DropPath(drop_prob=0.5)
-
         self.final_norm = nn.LayerNorm(output_dim)
         self.ln_post = LayerNorm(width)
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
@@ -153,11 +227,14 @@ class VisionTransformer(nn.Module):
                 nn.init.constant_(m.bias, 0)
                 nn.init.constant_(m.weight, 1.0)
 
-        nn.init.zeros_(self.cross_attn_layer.out_proj.weight)
-        nn.init.zeros_(self.cross_attn_layer.out_proj.bias)
-        nn.init.zeros_(self.cross_ff_layer[-1].weight)
-        nn.init.zeros_(self.cross_ff_layer[-1].bias)
-        
+        self.cross_post_adapter = CrossPostAudioAdapter(
+            dim=output_dim,
+            bottleneck=64,
+            film_scale=0.1,
+            gate_max=0.1,
+            audio_dropout=0.3,
+        )
+
     def init_weights(self, pretrained=None):
         def _init_weights(m):
             if isinstance(m, nn.Linear):
@@ -195,7 +272,9 @@ class VisionTransformer(nn.Module):
         x = self.conv1(x)  # shape = [*, width, grid, grid]
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
         x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
-        x = torch.cat([self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)  # shape = [*, grid ** 2 + 1, width]
+        x = torch.cat(
+            [self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device),
+             x], dim=1)  # shape = [*, grid ** 2 + 1, width]
         x = x + self.positional_embedding.to(x.dtype)
         x = self.ln_pre(x)
 
@@ -231,16 +310,10 @@ class VisionTransformer(nn.Module):
             key_frame_len=T,
             seeds_per_frame=8
         )
-
         rel_bias = rel_bias.repeat(B, 1, 1)
-        context = self.context_attn(self.context_q_norm(x_cls), seeds, seeds, attn_mask=rel_bias, average_attn_weights=False, need_weights=False)
-        x = x_cls + F.sigmoid(self.context_alpha) * context
-
-        audio = self.cross_drop(audio)
-        cross_attn = self.cross_attn_layer(query=self.cross_norm1_layer(x), key=audio, value=audio, need_weights=False)
-        cross_attn = self.cross_norm2_layer(cross_attn)
-        x = x + F.tanh(self.cross_gate1) * cross_attn
-        x = x + F.tanh(self.cross_gate2) * self.cross_ff_layer(self.cross_norm3_layer(x))
+        context, _ = self.context_attn(self.context_q_norm(x_cls), seeds, seeds, attn_mask=rel_bias,
+                                       average_attn_weights=False, need_weights=False)
+        x = x_cls + torch.tanh(self.context_alpha) * context
 
         x = torch.cat([self.temporal_cls.expand(x.shape[0], -1, -1), x], dim=1)
         x = x + self.temporal_embedding
@@ -248,4 +321,5 @@ class VisionTransformer(nn.Module):
         x = x[:, 0, :]
         x = self.final_norm(x)
 
+        x = self.cross_post_adapter(x, audio)
         return x

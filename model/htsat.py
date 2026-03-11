@@ -786,9 +786,8 @@ class HTSAT_Swin_Transformer(nn.Module):
         B, N, C = x.shape
         SF = frames_num // (2 ** (len(self.depths) - 1)) // self.patch_stride[0]
         ST = frames_num // (2 ** (len(self.depths) - 1)) // self.patch_stride[1]
-        x = x.permute(0,2,1).contiguous().reshape(B, SF, ST, C)
+        x = x.permute(0,2,1).contiguous().reshape(B, C, SF, ST)
 
-        return x.mean(dim=1)
         B, C, F, T = x.shape
         # group 2D CNN
         c_freq_bin = F // self.freq_ratio
