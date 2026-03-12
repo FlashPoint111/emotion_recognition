@@ -49,88 +49,67 @@ class CrossPostAudioAdapter(nn.Module):
     def __init__(
             self,
             dim: int = 512,
-            bottleneck: int = 64,
-            film_scale: float = 0.1,
-            gate_max: float = 0.1,
             audio_dropout: float = 0.3,
     ):
         super().__init__()
         self.dim = dim
-        self.film_scale = film_scale
-        self.gate_max = gate_max
-        self.audio_dropout = audio_dropout
 
-        self.x_norm = LayerNorm(dim)
         self.a_norm = LayerNorm(dim)
+        self.x_norm = LayerNorm(dim)
 
-        self.gamma_fc = nn.Linear(dim, dim)
-        self.beta_fc = nn.Linear(dim, dim)
+        self.gamma = nn.Sequential(
+            nn.Linear(dim, dim // 4),
+            nn.GELU(),
+            nn.Linear(dim // 4, dim)
+        )
 
-        self.adapter_down = nn.Linear(dim, bottleneck)
-        self.adapter_act = nn.GELU()
-        self.adapter_up = nn.Linear(bottleneck, dim)
+        self.beta = nn.Sequential(
+            nn.Linear(dim, dim // 4),
+            nn.GELU(),
+            nn.Linear(dim // 4, dim)
+        )
 
-        self.gate_fc1 = nn.Linear(dim * 2, dim)
-        self.gate_act = nn.GELU()
-        self.gate_fc2 = nn.Linear(dim, dim)
-
+        self.gate = nn.Sequential(
+            nn.Linear(dim, dim // 4),
+            nn.GELU(),
+            nn.Linear(dim // 4, dim)
+        )
+        self.drop = DropPath(audio_dropout)
         self.reset_parameters()
 
     def reset_parameters(self):
-        nn.init.zeros_(self.gamma_fc.weight)
-        nn.init.zeros_(self.gamma_fc.bias)
-        nn.init.zeros_(self.beta_fc.weight)
-        nn.init.zeros_(self.beta_fc.bias)
+        nn.init.xavier_normal(self.gamma[0].weight)
+        nn.init.zeros_(self.gamma[0].bias)
+        nn.init.zeros_(self.gamma[-1].weight)
+        nn.init.zeros_(self.gamma[-1].bias)
 
-        nn.init.trunc_normal_(self.adapter_down.weight, std=0.02)
-        nn.init.constant_(self.adapter_down.bias, 0.0)
-        nn.init.zeros_(self.adapter_up.weight)
-        nn.init.zeros_(self.adapter_up.bias)
+        nn.init.xavier_normal(self.beta[0].weight)
+        nn.init.zeros_(self.beta[0].bias)
+        nn.init.zeros_(self.beta[-1].weight)
+        nn.init.zeros_(self.beta[-1].bias)
 
-        nn.init.trunc_normal_(self.gate_fc1.weight, std=0.02)
-        nn.init.constant_(self.gate_fc1.bias, 0.0)
-        nn.init.zeros_(self.gate_fc2.weight)
-        nn.init.constant_(self.gate_fc2.bias, -4.0)  # sigmoid(-4) ≈ 0.018
+        nn.init.xavier_normal(self.gate[0].weight)
+        nn.init.zeros_(self.gate[0].bias)
+        nn.init.xavier_normal(self.gate[-1].weight)
+        nn.init.zeros_(self.gate[-1].bias)
 
-    def _apply_audio_dropout(self, a: torch.Tensor) -> torch.Tensor:
-        if (not self.training) or self.audio_dropout <= 0:
-            return a
-        keep = (torch.rand(a.shape[0], 1, device=a.device) > self.audio_dropout).to(a.dtype)
-        return a * keep
+        nn.init.constant_(self.x_norm.bias, 0)
+        nn.init.constant_(self.x_norm.weight, 1.0)
+        nn.init.constant_(self.a_norm.bias, 0)
+        nn.init.constant_(self.a_norm.weight, 1.0)
 
-    def forward(self, sample_cls: torch.Tensor, audio_global: torch.Tensor, return_aux: bool = False):
-        if audio_global.dim() == 3:
-            audio_global = audio_global.mean(dim=1)
 
+    def forward(self, sample_cls: torch.Tensor, audio: torch.Tensor):
         x0 = sample_cls
-        x = self.x_norm(sample_cls)
 
-        a = self.a_norm(audio_global)
-        a = self._apply_audio_dropout(a)
+        a = audio
+        gamma = self.gamma(a)
+        beta = self.beta(a)
+        gate = self.gate(a)
 
-        gamma = 1.0 + self.film_scale * torch.tanh(self.gamma_fc(a))  # [B, D]
-        beta = self.film_scale * torch.tanh(self.beta_fc(a))  # [B, D]
+        out = x0 + torch.tanh(gate) * self.a_norm(gamma * x0 + beta)
+        out = self.x_norm(out)
 
-        x_mod = gamma * x + beta
-
-        delta = self.adapter_up(self.adapter_act(self.adapter_down(x_mod)))  # [B, D]
-
-        gate_in = torch.cat([x, a], dim=-1)  # [B, 2D]
-        gate = self.gate_max * torch.sigmoid(
-            self.gate_fc2(self.gate_act(self.gate_fc1(gate_in)))
-        )  # [B, D], each dim in (0, gate_max)
-
-        out = x0 + gate * delta
-
-        if return_aux:
-            aux = {
-                "gamma": gamma,
-                "beta": beta,
-                "gate": gate,
-                "delta_norm": delta.norm(dim=-1).mean().detach(),
-                "gate_mean": gate.mean().detach(),
-            }
-            return out, aux
         return out
 
 
@@ -229,9 +208,6 @@ class VisionTransformer(nn.Module):
 
         self.cross_post_adapter = CrossPostAudioAdapter(
             dim=output_dim,
-            bottleneck=64,
-            film_scale=0.1,
-            gate_max=0.1,
             audio_dropout=0.3,
         )
 

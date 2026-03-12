@@ -12,7 +12,7 @@ train:
   use_frame: True
   batch_size: 8
   resume: False
-  checkpoint_path: ./output/20260303/checkpoint_42.pth
+  checkpoint_path: ./output/20260311/best_checkpoint.pth
   output_dir: ./output/
   pretrain_file: F:/mae_face_pretrain_vit_base.pth
 

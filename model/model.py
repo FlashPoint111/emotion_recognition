@@ -283,7 +283,7 @@ class CLAIP(nn.Module):
 
         image_features = image_features / image_features.norm(dim=1, keepdim=True)
         text_features = text_features / text_features.norm(dim=1, keepdim=True)
-        # audio_features = audio_features / audio_features.norm(dim=1, keepdim=True)
+        audio_features = audio_features / audio_features.norm(dim=1, keepdim=True)
 
         p_features = text_features[:11, :]
         n_features = text_features[11:, :]
@@ -293,17 +293,17 @@ class CLAIP(nn.Module):
         image_n_logits = logit_scale * image_features @ n_features.t()
         logits = image_p_logits - image_n_logits
 
-        # logit_scale_a = self.logit_scale_a.clamp(max=math.log(100)).exp()
-        # audio_p_logits = logit_scale_a * audio_features @ p_features.t()
-        # audio_n_logits = logit_scale_a * audio_features @ n_features.t()
-        # audio_logits = audio_p_logits - audio_n_logits
+        logit_scale_a = self.logit_scale_a.clamp(max=math.log(100)).exp()
+        audio_p_logits = logit_scale_a * audio_features @ p_features.t()
+        audio_n_logits = logit_scale_a * audio_features @ n_features.t()
+        audio_logits = audio_p_logits - audio_n_logits
 
         # logits = wv * image_logits + wa * audio_logits
         if label is not None:
-            fused_ce = F.cross_entropy(logits, label)
 
             # img_ce = F.cross_entropy(image_logits, label, reduction='none')
-            # aud_ce = F.cross_entropy(audio_logits, label, reduction='none')
+            aud_ce = F.cross_entropy(audio_logits, label)
+            fused_ce = F.cross_entropy(logits, label) + 0.1 * aud_ce
             #
             # w_hat = torch.stack([-img_ce, -aud_ce], dim=-1)
             # w_hat = F.softmax(w_hat / 2, dim=-1)
