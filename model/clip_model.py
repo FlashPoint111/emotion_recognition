@@ -70,9 +70,9 @@ class CrossPostAudioAdapter(nn.Module):
         )
 
         self.gate = nn.Sequential(
-            nn.Linear(dim, dim // 4),
+            nn.Linear(dim, dim // 8),
             nn.GELU(),
-            nn.Linear(dim // 4, dim)
+            nn.Linear(dim // 8, dim)
         )
         self.drop = DropPath(audio_dropout)
         self.reset_parameters()
@@ -193,7 +193,8 @@ class VisionTransformer(nn.Module):
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
         self.context_rel_bias = RelativeTemporalBias1D(num_heads=8, max_frames=16)
         self.context_attn = nn.MultiheadAttention(512, 8, batch_first=True)
-        self.context_alpha = nn.Parameter(torch.zeros([]))
+
+        self.context_alpha = nn.Parameter(torch.zeros([16]))
         self.context_seed_norm = LayerNorm(output_dim)
         self.context_q_norm = LayerNorm(output_dim)
 
@@ -205,7 +206,6 @@ class VisionTransformer(nn.Module):
             elif isinstance(m, nn.LayerNorm):
                 nn.init.constant_(m.bias, 0)
                 nn.init.constant_(m.weight, 1.0)
-
         self.cross_post_adapter = CrossPostAudioAdapter(
             dim=output_dim,
             audio_dropout=0.3,
@@ -289,7 +289,8 @@ class VisionTransformer(nn.Module):
         rel_bias = rel_bias.repeat(B, 1, 1)
         context, _ = self.context_attn(self.context_q_norm(x_cls), seeds, seeds, attn_mask=rel_bias,
                                        average_attn_weights=False, need_weights=False)
-        x = x_cls + torch.tanh(self.context_alpha) * context
+        context_alpha = self.context_alpha.repeat(B, 1).unsqueeze(-1)
+        x = x_cls + torch.tanh(context_alpha) * context
 
         x = torch.cat([self.temporal_cls.expand(x.shape[0], -1, -1), x], dim=1)
         x = x + self.temporal_embedding

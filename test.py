@@ -15,7 +15,7 @@ if __name__ == '__main__':
 
     device = torch.device('cuda')
     cudnn.benchmark = True
-    criterion = None #SoftTargetCrossEntropy()
+    criterion = None  # SoftTargetCrossEntropy()
     model = CLAIP(loss_fn=criterion).to(device)
     checkpoint_path = "./output/best_checkpoint.pth"
     if os.path.isfile(checkpoint_path):
@@ -48,58 +48,49 @@ if __name__ == '__main__':
             input_dict[k] = ori_audio[k].to(device, non_blocking=True)
         label = sample["label"].to(device, non_blocking=True)
         with (torch.no_grad()):
-            logits, image_logits, audio_logits = model(image, input_dict)
+            logits = model(image, input_dict)
         for j in range(len(frame)):
-            temp = {'logits': [], 'label': label[j].cpu(), 'image_logits': [], 'audio_logits': []}
+            temp = {'logits': [], 'label': label[j].cpu()}
             result.setdefault(frame[j], temp)['logits'].append(logits[j].cpu())
-            result.setdefault(frame[j], temp)['image_logits'].append(image_logits[j].cpu())
-            result.setdefault(frame[j], temp)['audio_logits'].append(audio_logits[j].cpu())
-
-    all_r = []
-    total_agree = 0
-    agree_pred = []
-    agree_label = []
-    disagree_pred = []
-    disagree_label = []
-    disagree_pred_image = []
-    agree_pred_image = []
+            # result.setdefault(frame[j], temp)['image_logits'].append(image_logits[j].cpu())
+            # result.setdefault(frame[j], temp)['audio_logits'].append(audio_logits[j].cpu())
 
     for item in result:
         temp = result[item]
         logits = torch.stack(temp['logits']).mean(dim=0)
-        image_logits = torch.stack(temp['image_logits']).mean(dim=0)
-        audio_logits = torch.stack(temp['audio_logits']).mean(dim=0)
+        # image_logits = torch.stack(temp['image_logits']).mean(dim=0)
+        # audio_logits = torch.stack(temp['audio_logits']).mean(dim=0)
         logits = torch.softmax(logits, dim=0)
         all_preds.append(torch.argmax(logits))
         all_labels.append(temp['label'])
-        r = audio_logits.norm() / image_logits.norm()
-        all_r.append(r)
-        agree = (logits.argmax() == image_logits.argmax())
-        total_agree = total_agree + agree
-        if agree:
-            agree_pred.append(torch.argmax(logits))
-            agree_label.append(temp['label'])
-            agree_pred_image.append(torch.argmax(image_logits))
-        else:
-            disagree_pred.append(torch.argmax(logits))
-            disagree_label.append(temp['label'])
-            disagree_pred_image.append(torch.argmax(image_logits))
+        # r = audio_logits.norm() / image_logits.norm()
+        # all_r.append(r)
+        # agree = (logits.argmax() == image_logits.argmax())
+        # total_agree = total_agree + agree
+        # if agree:
+        #     agree_pred.append(torch.argmax(logits))
+        #     agree_label.append(temp['label'])
+        #     agree_pred_image.append(torch.argmax(image_logits))
+        # else:
+        #     disagree_pred.append(torch.argmax(logits))
+        #     disagree_label.append(temp['label'])
+        #     disagree_pred_image.append(torch.argmax(image_logits))
 
     all_preds = torch.stack(all_preds)
     all_labels = torch.stack(all_labels)
-    agree_pred = torch.stack(agree_pred)
-    agree_label = torch.stack(agree_label)
-    disagree_pred = torch.stack(disagree_pred)
-    disagree_label = torch.stack(disagree_label)
-    disagree_pred_image = torch.stack(disagree_pred_image)
-    agree_pred_image = torch.stack(agree_pred_image)
+    # agree_pred = torch.stack(agree_pred)
+    # agree_label = torch.stack(agree_label)
+    # disagree_pred = torch.stack(disagree_pred)
+    # disagree_label = torch.stack(disagree_label)
+    # disagree_pred_image = torch.stack(disagree_pred_image)
+    # agree_pred_image = torch.stack(agree_pred_image)
 
-    all_r = torch.stack(all_r)
-    print(f"The norm ratio is {all_r.mean()}")
+    # all_r = torch.stack(all_r)
+    # print(f"The norm ratio is {all_r.mean()}")
 
     emotions = ["anger", "disgust", "fear", "happiness", "neutral", "sadness", "surprise", "contempt", "anxiety",
-                      "helplessness",
-                      "disappointment"]
+                "helplessness",
+                "disappointment"]
     # Overall accuracy
     accuracy = accuracy_score(all_labels.numpy(), all_preds.numpy())
     print("Overall Accuracy:", accuracy)
@@ -113,13 +104,12 @@ if __name__ == '__main__':
     war = accuracy_score(all_labels.numpy(), all_preds.numpy())
     print(f"WAR (Weighted Average Recall): {war:.4f}")
 
-    print(f"Non Flip ratio={total_agree / len(result):.4f}")
-
-    print(f"\nNon Flip group:\n {classification_report(agree_label.numpy(), agree_pred.numpy())}")
-
-    print(f"\nNon Flip group image:\n {classification_report(agree_label.numpy(), agree_pred_image.numpy())}")
-
-    print(f"\nFlip group:\n {confusion_matrix(disagree_label.numpy(), disagree_pred.numpy())}")
-
-    print(f"\nFlip group image:\n {confusion_matrix(disagree_label.numpy(), disagree_pred_image.numpy())}")
-
+# print(f"Non Flip ratio={total_agree / len(result):.4f}")
+#
+# print(f"\nNon Flip group:\n {classification_report(agree_label.numpy(), agree_pred.numpy())}")
+#
+# print(f"\nNon Flip group image:\n {classification_report(agree_label.numpy(), agree_pred_image.numpy())}")
+#
+# print(f"\nFlip group:\n {confusion_matrix(disagree_label.numpy(), disagree_pred.numpy())}")
+#
+# print(f"\nFlip group image:\n {confusion_matrix(disagree_label.numpy(), disagree_pred_image.numpy())}")
