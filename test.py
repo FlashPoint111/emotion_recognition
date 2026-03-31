@@ -5,19 +5,20 @@ from sklearn.metrics import balanced_accuracy_score, accuracy_score, classificat
 from timm.loss import SoftTargetCrossEntropy
 from torch.utils.data import DataLoader
 
-from dataset.preprocess_dataset_MAFW import *
+from dataset.preprocess_dataset_DFEW import *
 from dataset.video_dataloader import ImageAudioDataset
 from model.model import CLAIP
 
 if __name__ == '__main__':
-    with open("./config/AIM.yaml", "r") as f:
+    with open("./config/AIM2.yaml", "r") as f:
         config = yaml.safe_load(f)
 
     device = torch.device('cuda')
     cudnn.benchmark = True
     criterion = None  # SoftTargetCrossEntropy()
     model = CLAIP(loss_fn=criterion).to(device)
-    checkpoint_path = "./output/best_checkpoint.pth"
+    checkpoint_path = config['train']['checkpoint_path']
+    # checkpoint_path = "./output/DFEW-ALL/split1/best_model.pth"
     if os.path.isfile(checkpoint_path):
         print("=> loading checkpoint '{}'".format(checkpoint_path))
         checkpoint = torch.load(checkpoint_path, map_location='cpu')
@@ -34,26 +35,28 @@ if __name__ == '__main__':
     preprocess = None
     val_dataset_info = run_preprocessing(config, mode='val')
     val_dataset = ImageAudioDataset(config, val_dataset_info, preprocess, mode='test')
-    val_dataloader = DataLoader(val_dataset, batch_size=16, shuffle=False, num_workers=4, pin_memory=False)
+    val_dataloader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=16, pin_memory=True)
     all_labels = []
     all_preds = []
     result = {}
-    for i, sample in enumerate(val_dataloader):
-        frame = sample['frame']
-        image = sample["video"].to(device, non_blocking=True)
-        ori_audio = sample["audio"]
-        input_dict = {}
-        keys = ori_audio.keys()
-        for k in keys:
-            input_dict[k] = ori_audio[k].to(device, non_blocking=True)
-        label = sample["label"].to(device, non_blocking=True)
-        with (torch.no_grad()):
-            logits = model(image, input_dict)
-        for j in range(len(frame)):
-            temp = {'logits': [], 'label': label[j].cpu()}
-            result.setdefault(frame[j], temp)['logits'].append(logits[j].cpu())
-            # result.setdefault(frame[j], temp)['image_logits'].append(image_logits[j].cpu())
-            # result.setdefault(frame[j], temp)['audio_logits'].append(audio_logits[j].cpu())
+    with tqdm(total=len(val_dataloader)) as pbar:
+        for i, sample in enumerate(val_dataloader):
+            frame = sample['frame']
+            image = sample["video"].to(device, non_blocking=True)
+            ori_audio = sample["audio"]
+            input_dict = {}
+            keys = ori_audio.keys()
+            for k in keys:
+                input_dict[k] = ori_audio[k].to(device, non_blocking=True)
+            label = sample["label"].to(device, non_blocking=True)
+            with torch.no_grad():
+                logits = model(image, input_dict)
+            for j in range(len(frame)):
+                temp = {'logits': [], 'label': label[j].cpu()}
+                result.setdefault(frame[j], temp)['logits'].append(logits[j].cpu())
+                # result.setdefault(frame[j], temp)['image_logits'].append(image_logits[j].cpu())
+                # result.setdefault(frame[j], temp)['audio_logits'].append(audio_logits[j].cpu())
+            pbar.update(1)
 
     for item in result:
         temp = result[item]
@@ -103,6 +106,7 @@ if __name__ == '__main__':
 
     war = accuracy_score(all_labels.numpy(), all_preds.numpy())
     print(f"WAR (Weighted Average Recall): {war:.4f}")
+    print(confusion_matrix(all_labels.numpy(), all_preds.numpy()))
 
 # print(f"Non Flip ratio={total_agree / len(result):.4f}")
 #

@@ -3,6 +3,7 @@ from dataclasses import dataclass
 import laion_clap
 import numpy as np
 import open_clip
+from numba.cpython.mathimpl import log2_impl
 
 from .clip_model import Transformer, LayerNorm
 from .htsat import HTSAT_Swin_Transformer
@@ -65,7 +66,7 @@ class HTSAT(nn.Module):
         )
         model = laion_clap.CLAP_Module(enable_fusion=False, amodel='HTSAT-tiny')
         model.load_ckpt('./630k-audioset-best.pt')
-        pretrain = torch.load('./630k-audioset-best.pt')
+        pretrain = torch.load('./630k-audioset-best.pt', map_location='cpu')
         pretrain = pretrain['state_dict']
         prefix_to_remove = 'module.audio_branch.'
         len_prefix = len(prefix_to_remove)
@@ -117,26 +118,26 @@ class HTSAT(nn.Module):
 class CLAIP(nn.Module):
     def __init__(self, loss_fn):
         super().__init__()
-        self.context_length = 77
+        # self.context_length = 77
         self.visual = VisionTransformer(224, 16, 768, 12, 8, 512)
-        self.transformer = Transformer(
-            width=512,
-            layers=12,
-            heads=8,
-            attn_mask=self.build_attention_mask()
-        )
-        self.vocab_size = 49408
-        self.token_embedding = nn.Embedding(49408, 512)
-        self.positional_embedding = nn.Parameter(torch.empty(self.context_length, 512))
-        self.ln_final = LayerNorm(512)
+        # self.transformer = Transformer(
+        #     width=512,
+        #     layers=12,
+        #     heads=8,
+        #     attn_mask=self.build_attention_mask()
+        # )
+        # self.vocab_size = 49408
+        # self.token_embedding = nn.Embedding(49408, 512)
+        # self.positional_embedding = nn.Parameter(torch.empty(self.context_length, 512))
+        # self.ln_final = LayerNorm(512)
 
-        self.text_projection = nn.Parameter(torch.empty(512, 512))
+        # self.text_projection = nn.Parameter(torch.empty(512, 512))
         self.loss_fn = loss_fn if loss_fn is not None else nn.CrossEntropyLoss()
 
         self.initialize_clip_parameters()
         self.apply_lora()
-        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
-        self.logit_scale_a = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+        # self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+        # self.logit_scale_a = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
         for name, param in self.named_parameters():
             if 'temporal' in name or 'logit_scale' in name or 'final_norm' in name or 'context' in name or 'cross' in name:
@@ -146,35 +147,37 @@ class CLAIP(nn.Module):
 
         '''self.gate = nn.Linear(1024, 2)
         self.kl_loss = nn.KLDivLoss()'''
-        n_ctx = 8
-        ctx_dim = 512
-        tokenizer = open_clip.get_tokenizer('ViT-B-16')
-        classnames = ["anger", "disgust", "fear", "happiness", "neutral", "sadness", "surprise", "contempt", "anxiety",
-                      "helplessness",
-                      "disappointment"]
-        n_cls = len(classnames)
-        p_ctx_vectors = torch.empty(n_ctx, ctx_dim)
-        n_ctx_vectors = torch.empty(n_ctx, ctx_dim)
-        nn.init.normal_(p_ctx_vectors, std=0.02)
-        nn.init.normal_(n_ctx_vectors, std=0.02)
-        prompt_prefix = " ".join(["X"] * n_ctx)
+        # n_ctx = 8
+        # ctx_dim = 512
+        # tokenizer = open_clip.get_tokenizer('ViT-B-16')
+        # classnames = ["anger", "disgust", "fear", "happiness", "neutral", "sadness", "surprise", "contempt", "anxiety",
+        #               "helplessness",
+        #               "disappointment"]
+        # n_cls = len(classnames)
+        # p_ctx_vectors = torch.empty(n_ctx, ctx_dim)
+        # n_ctx_vectors = torch.empty(n_ctx, ctx_dim)
+        # nn.init.normal_(p_ctx_vectors, std=0.02)
+        # nn.init.normal_(n_ctx_vectors, std=0.02)
+        # prompt_prefix = " ".join(["X"] * n_ctx)
 
-        self.p_ctx = nn.Parameter(p_ctx_vectors)
-        self.n_ctx = nn.Parameter(n_ctx_vectors)
-        p_prompts = [prompt_prefix + " " + name + "." for name in classnames]
-        n_prompts = [prompt_prefix + " no " + name + "." for name in classnames]
-        self.p_tokenized_prompts = torch.cat([tokenizer(p) for p in p_prompts])
-        self.n_tokenized_prompts = torch.cat([tokenizer(p) for p in n_prompts])
+        # self.p_ctx = nn.Parameter(p_ctx_vectors)
+        # self.n_ctx = nn.Parameter(n_ctx_vectors)
+        # p_prompts = [prompt_prefix + " " + name + "." for name in classnames]
+        # n_prompts = [prompt_prefix + " no " + name + "." for name in classnames]
+        # self.p_tokenized_prompts = torch.cat([tokenizer(p) for p in p_prompts])
+        # self.n_tokenized_prompts = torch.cat([tokenizer(p) for p in n_prompts])
 
-        with torch.no_grad():
-            p_embedding = self.token_embedding(self.p_tokenized_prompts)
-            n_embedding = self.token_embedding(self.n_tokenized_prompts)
+        # with torch.no_grad():
+        #     p_embedding = self.token_embedding(self.p_tokenized_prompts)
+        #     n_embedding = self.token_embedding(self.n_tokenized_prompts)
 
-        self.register_buffer("token_prefix", p_embedding[:, :1, :])  # SOS
-        self.register_buffer("p_token_suffix", p_embedding[:, 1 + n_ctx:, :])  # CLS, EOS
-        self.register_buffer("n_token_suffix", n_embedding[:, 1 + n_ctx:, :])
+        # self.register_buffer("token_prefix", p_embedding[:, :1, :])  # SOS
+        # self.register_buffer("p_token_suffix", p_embedding[:, 1 + n_ctx:, :])  # CLS, EOS
+        # self.register_buffer("n_token_suffix", n_embedding[:, 1 + n_ctx:, :])
+        
 
         self.audio_encoder = HTSAT()
+        self.fuse_fc = nn.Linear(512+512, 11)
 
         trainable_params = list(filter(lambda p: p.requires_grad, self.parameters()))
         num_trainable = sum(p.numel() for p in trainable_params)
@@ -190,20 +193,20 @@ class CLAIP(nn.Module):
                 nn.init.constant_(m.bias, 0)
                 nn.init.constant_(m.weight, 1.0)
 
-        nn.init.normal_(self.token_embedding.weight, std=0.02)
-        nn.init.normal_(self.positional_embedding, std=0.01)
+        # nn.init.normal_(self.token_embedding.weight, std=0.02)
+        # nn.init.normal_(self.positional_embedding, std=0.01)
 
-        proj_std = (self.transformer.width ** -0.5) * ((2 * self.transformer.layers) ** -0.5)
-        attn_std = self.transformer.width ** -0.5
-        fc_std = (2 * self.transformer.width) ** -0.5
-        for block in self.transformer.resblocks:
-            nn.init.normal_(block.attn.in_proj_weight, std=attn_std)
-            nn.init.normal_(block.attn.out_proj.weight, std=proj_std)
-            nn.init.normal_(block.mlp.c_fc.weight, std=fc_std)
-            nn.init.normal_(block.mlp.c_proj.weight, std=proj_std)
+        # proj_std = (self.transformer.width ** -0.5) * ((2 * self.transformer.layers) ** -0.5)
+        # attn_std = self.transformer.width ** -0.5
+        # fc_std = (2 * self.transformer.width) ** -0.5
+        # for block in self.transformer.resblocks:
+        #     nn.init.normal_(block.attn.in_proj_weight, std=attn_std)
+        #     nn.init.normal_(block.attn.out_proj.weight, std=proj_std)
+        #     nn.init.normal_(block.mlp.c_fc.weight, std=fc_std)
+        #     nn.init.normal_(block.mlp.c_proj.weight, std=proj_std)
 
-        if self.text_projection is not None:
-            nn.init.normal_(self.text_projection, std=self.transformer.width ** -0.5)
+        # if self.text_projection is not None:
+        #     nn.init.normal_(self.text_projection, std=self.transformer.width ** -0.5)
 
         clip_model, _, preprocess = open_clip.create_model_and_transforms(
             "ViT-B-16",
@@ -213,7 +216,6 @@ class CLAIP(nn.Module):
         del clip_model
         msg = self.load_state_dict(pretrain_dict, strict=False)
         print(msg)
-        torch.cuda.empty_cache()
 
     def build_attention_mask(self):
         mask = torch.empty(self.context_length, self.context_length)
@@ -222,13 +224,13 @@ class CLAIP(nn.Module):
         return mask
 
     def apply_lora(self):
-        for i, block in enumerate(self.transformer.resblocks):
-            for name, submodule in block.named_children():
-                if isinstance(submodule, nn.MultiheadAttention):
-                    new_multi_head_lora = PlainMultiheadAttentionLoRA(
-                        submodule, enable_lora=['q', 'k', 'v'], r=4, lora_alpha=8,
-                        dropout_rate=0.1)
-                    setattr(block, name, new_multi_head_lora)
+        # for i, block in enumerate(self.transformer.resblocks):
+        #     for name, submodule in block.named_children():
+        #         if isinstance(submodule, nn.MultiheadAttention):
+        #             new_multi_head_lora = PlainMultiheadAttentionLoRA(
+        #                 submodule, enable_lora=['q', 'k', 'v'], r=4, lora_alpha=8,
+        #                 dropout_rate=0.1)
+        #             setattr(block, name, new_multi_head_lora)
         for i, block in enumerate(self.visual.transformer.resblocks):
             for name, submodule in block.named_children():
                 if isinstance(submodule, nn.MultiheadAttention):
@@ -255,55 +257,53 @@ class CLAIP(nn.Module):
         return x
 
     def forward(self, image, audio, label=None, mix_lambda=None):
-        p_ctx = self.p_ctx
-        n_ctx = self.n_ctx
-        if p_ctx.dim() == 2:
-            p_ctx = p_ctx.unsqueeze(0).expand(11, -1, -1)
-            n_ctx = n_ctx.unsqueeze(0).expand(11, -1, -1)
+        # p_ctx = self.p_ctx
+        # n_ctx = self.n_ctx
+        # if p_ctx.dim() == 2:
+        #     p_ctx = p_ctx.unsqueeze(0).expand(11, -1, -1)
+        #     n_ctx = n_ctx.unsqueeze(0).expand(11, -1, -1)
 
-        prefix = self.token_prefix
-        p_suffix = self.p_token_suffix
-        n_suffix = self.n_token_suffix
+        # prefix = self.token_prefix
+        # p_suffix = self.p_token_suffix
+        # n_suffix = self.n_token_suffix
 
-        p_prompts = torch.cat([prefix, p_ctx, p_suffix], dim=1)
-        n_prompts = torch.cat([prefix, n_ctx, n_suffix], dim=1)
+        # p_prompts = torch.cat([prefix, p_ctx, p_suffix], dim=1)
+        # n_prompts = torch.cat([prefix, n_ctx, n_suffix], dim=1)
 
-        x = torch.cat([p_prompts, n_prompts], dim=0)
-        text = torch.cat([self.p_tokenized_prompts, self.n_tokenized_prompts]).to(x.device)
+        # x = p_prompts
+        # text = self.p_tokenized_prompts.to(x.device)
 
         audio_features = self.encode_audio(audio, mix_lambda)
         image_features = self.encode_image(image, audio_features)
-        text_features = self.encode_text(text, x)
+        # text_features = self.encode_text(text, x)
 
         # gate_in = torch.cat([image_features, audio_features], dim=-1)
         # gate_logits = self.gate(gate_in.detach())
         # w = F.log_softmax(gate_logits, dim=-1)
         # wv = w[:, 0].exp().unsqueeze(-1)
         # wa = w[:, 1].exp().unsqueeze(-1)
-
-        image_features = image_features / image_features.norm(dim=1, keepdim=True)
+        '''
+        l2_image_features = image_features / image_features.norm(dim=1, keepdim=True)
         text_features = text_features / text_features.norm(dim=1, keepdim=True)
-        audio_features = audio_features / audio_features.norm(dim=1, keepdim=True)
+        l2_audio_features = audio_features / audio_features.norm(dim=1, keepdim=True)
 
-        p_features = text_features[:11, :]
-        n_features = text_features[11:, :]
+        p_features = text_features
 
         logit_scale = self.logit_scale.clamp(max=math.log(100)).exp()
-        image_p_logits = logit_scale * image_features @ p_features.t()
-        image_n_logits = logit_scale * image_features @ n_features.t()
-        logits = image_p_logits - image_n_logits
+        image_logits = logit_scale * l2_image_features @ p_features.t()
 
         logit_scale_a = self.logit_scale_a.clamp(max=math.log(100)).exp()
-        audio_p_logits = logit_scale_a * audio_features @ p_features.t()
-        audio_n_logits = logit_scale_a * audio_features @ n_features.t()
-        audio_logits = audio_p_logits - audio_n_logits
+        audio_logits = logit_scale_a * l2_audio_features @ p_features.t()
+        '''
+        
+        fuse_embed = torch.cat([image_features, audio_features], dim=1)
+        logits = self.fuse_fc(fuse_embed)
 
         # logits = wv * image_logits + wa * audio_logits
         if label is not None:
-
-            # img_ce = F.cross_entropy(image_logits, label, reduction='none')
-            aud_ce = F.cross_entropy(audio_logits, label)
-            fused_ce = F.cross_entropy(logits, label) + 0.1 * aud_ce
+            # img_ce = F.cross_entropy(image_logits, label)
+            # aud_ce = F.cross_entropy(audio_logits, label)
+            fused_ce = F.cross_entropy(logits, label)
             #
             # w_hat = torch.stack([-img_ce, -aud_ce], dim=-1)
             # w_hat = F.softmax(w_hat / 2, dim=-1)
@@ -313,7 +313,8 @@ class CLAIP(nn.Module):
             # loss = fused_ce + 0.5 * (((1 - wv.detach()).squeeze() * img_ce).mean() + (
             #             (1 - wa.detach()).squeeze() * aud_ce).mean()) + kl_loss
 
-            neg_loss = F.relu((p_features * n_features).sum(dim=1)).mean()
+            # neg_loss = F.relu((p_features * n_features).sum(dim=1)).mean()
+            neg_loss = 0
 
             if self.training:
                 return fused_ce, neg_loss

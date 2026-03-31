@@ -206,10 +206,6 @@ class VisionTransformer(nn.Module):
             elif isinstance(m, nn.LayerNorm):
                 nn.init.constant_(m.bias, 0)
                 nn.init.constant_(m.weight, 1.0)
-        self.cross_post_adapter = CrossPostAudioAdapter(
-            dim=output_dim,
-            audio_dropout=0.3,
-        )
 
     def init_weights(self, pretrained=None):
         def _init_weights(m):
@@ -257,14 +253,18 @@ class VisionTransformer(nn.Module):
         x = x.permute(1, 0, 2)  # NLD -> LND
         x = self.transformer(x)
         x = x.permute(1, 0, 2)  # LND -> NLD
+
         '''
         x = self.ln_post(x[:, 0, :])
         x = rearrange(x, '(b t) d -> b t d', b=B, t=T)
+        x = x @ self.proj
         '''
+        
+        
         x_cls_raw = self.ln_post(x[:, 0, :])
         x = torch.cat([x_cls_raw.unsqueeze(1), x[:, 1:, :]], dim=1)
         x = x @ self.proj
-
+        
         x_l2 = F.normalize(x, dim=-1)
         x_cls = x[:, 0, :]
         x_patch = x[:, 1:, :]
@@ -291,12 +291,14 @@ class VisionTransformer(nn.Module):
                                        average_attn_weights=False, need_weights=False)
         context_alpha = self.context_alpha.repeat(B, 1).unsqueeze(-1)
         x = x_cls + torch.tanh(context_alpha) * context
-
+        
+        
         x = torch.cat([self.temporal_cls.expand(x.shape[0], -1, -1), x], dim=1)
         x = x + self.temporal_embedding
         x = self.temporal_transformer_layer(x)
         x = x[:, 0, :]
         x = self.final_norm(x)
+        
 
-        x = self.cross_post_adapter(x, audio)
+        # x = self.cross_post_adapter(x, audio)
         return x

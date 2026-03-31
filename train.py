@@ -21,7 +21,7 @@ from torch.utils.data.distributed import DistributedSampler
 from transformers import get_cosine_schedule_with_warmup
 
 import utils.utils as utils
-from dataset.preprocess_dataset_MAFW import *
+from dataset.preprocess_dataset_DFEW import *
 from dataset.video_dataloader import ImageAudioDataset
 from model.model import CLAIP
 from model.utils import get_mix_lambda, do_mixup
@@ -162,7 +162,7 @@ def train(model, data_loader, optimizer, epoch, mixup_fn, device, scheduler, acc
         with autocast(dtype=torch.bfloat16):
             # loss = model(input_dict, mix_lambda, label)
             loss, neg_loss = model(image, input_dict, label, mix_lambda)
-            loss = loss + neg_loss
+            loss = loss + 0.05 * neg_loss
             loss = loss / accum
 
         loss.backward()
@@ -288,7 +288,7 @@ def main():
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     cudnn.benchmark = True
-    with open("./config/AIM.yaml", "r") as f:
+    with open("./config/AIM2.yaml", "r") as f:
         config = yaml.safe_load(f)
     start_epoch = 0
     max_epoch = 100
