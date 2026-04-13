@@ -2,7 +2,6 @@ import torch
 import torch.backends.cudnn as cudnn
 import yaml
 from sklearn.metrics import balanced_accuracy_score, accuracy_score, classification_report, confusion_matrix
-from timm.loss import SoftTargetCrossEntropy
 from torch.utils.data import DataLoader
 
 from dataset.preprocess_dataset_DFEW import *
@@ -35,7 +34,7 @@ if __name__ == '__main__':
     preprocess = None
     val_dataset_info = run_preprocessing(config, mode='val')
     val_dataset = ImageAudioDataset(config, val_dataset_info, preprocess, mode='test')
-    val_dataloader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=16, pin_memory=True)
+    val_dataloader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=0, pin_memory=False)
     all_labels = []
     all_preds = []
     result = {}

@@ -295,7 +295,8 @@ class CLAIP(nn.Module):
         logit_scale_a = self.logit_scale_a.clamp(max=math.log(100)).exp()
         audio_logits = logit_scale_a * l2_audio_features @ p_features.t()
         '''
-        
+
+        zeros = torch.zeros_like(image_features)
         fuse_embed = torch.cat([image_features, audio_features], dim=1)
         logits = self.fuse_fc(fuse_embed)
 

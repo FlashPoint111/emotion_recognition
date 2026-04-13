@@ -143,7 +143,7 @@ class ResidualAttentionBlock(nn.Module):
 
     def attention(self, x: torch.Tensor):
         self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
-        return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
+        return self.attn(x, x, x, need_weights=True, attn_mask=self.attn_mask)
 
     def forward(self, x: torch.Tensor):
         x = x + self.attention(self.ln_1(x))
@@ -254,13 +254,13 @@ class VisionTransformer(nn.Module):
         x = self.transformer(x)
         x = x.permute(1, 0, 2)  # LND -> NLD
 
-        '''
-        x = self.ln_post(x[:, 0, :])
+
+        '''x = self.ln_post(x[:, 0, :])
         x = rearrange(x, '(b t) d -> b t d', b=B, t=T)
-        x = x @ self.proj
-        '''
-        
-        
+        x = x @ self.proj'''
+
+
+
         x_cls_raw = self.ln_post(x[:, 0, :])
         x = torch.cat([x_cls_raw.unsqueeze(1), x[:, 1:, :]], dim=1)
         x = x @ self.proj
@@ -291,14 +291,15 @@ class VisionTransformer(nn.Module):
                                        average_attn_weights=False, need_weights=False)
         context_alpha = self.context_alpha.repeat(B, 1).unsqueeze(-1)
         x = x_cls + torch.tanh(context_alpha) * context
-        
+
         
         x = torch.cat([self.temporal_cls.expand(x.shape[0], -1, -1), x], dim=1)
         x = x + self.temporal_embedding
         x = self.temporal_transformer_layer(x)
         x = x[:, 0, :]
         x = self.final_norm(x)
-        
 
+
+        # x = x.mean(dim=1)
         # x = self.cross_post_adapter(x, audio)
         return x
